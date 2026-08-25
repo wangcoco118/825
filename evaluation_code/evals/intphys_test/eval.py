@@ -39,6 +39,7 @@ from src.masks.utils import apply_masks
 import src.models.vision_transformer as vit
 import src.models.predictor as vit_pred
 from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
+from src.models.fsonn import OpticalQKVConfig
 from evals.intphys_test.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
 from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
@@ -91,6 +92,8 @@ def main(args_eval, resume_preempt=False):
     is_causal = args_pretrain.get('is_causal', False)
     pred_is_causal = args_pretrain.get('pred_is_causal', False)
     pred_depth = args_pretrain.get('pred_depth', 12)
+    optical_qkv = args_eval.get('optical_qkv', {})
+    predictor_checkpoint = args_eval.get("predictor_checkpoint")
     pretrained_path = os.path.join(pretrain_folder, ckp_fname)
     # [for Video model]:
     tubelet_size = args_pretrain.get('tubelet_size', 2)
@@ -138,7 +141,7 @@ def main(args_eval, resume_preempt=False):
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
 
     # -- log/checkpointing paths
-    folder = os.path.join(pretrain_folder, 'intphys_test/')
+    folder = args_eval.get("output_dir") or os.path.join(pretrain_folder, 'intphys_test/')
     if eval_tag is not None:
         folder = os.path.join(folder, f"{dataset}-{eval_tag}")
     if not os.path.exists(folder):
@@ -163,7 +166,9 @@ def main(args_eval, resume_preempt=False):
         use_SiLU=use_SiLU,
         wide_SiLU=wide_SiLU,
         use_sdpa=use_sdpa,
-        is_mae=is_mae)
+        is_mae=is_mae,
+        optical_qkv=optical_qkv,
+        predictor_checkpoint=predictor_checkpoint)
     
     if not is_mae:
         target_encoder.eval()
@@ -501,6 +506,35 @@ def load_pretrained(
     return encoder,target_encoder, predictor
 
 
+def _load_trained_predictor(predictor, checkpoint_path):
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    if checkpoint.get("mode") != "end_to_end_jepa":
+        raise ValueError(
+            "trained Predictor checkpoint must have mode=end_to_end_jepa"
+        )
+    state_dict = checkpoint.get("predictor")
+    if state_dict is None:
+        raise ValueError("trained Predictor checkpoint has no full Predictor state")
+    normalized = {
+        key.replace("module.", ""): value for key, value in state_dict.items()
+    }
+    expected = predictor.state_dict()
+    missing = sorted(set(expected).difference(normalized))
+    unexpected = sorted(set(normalized).difference(expected))
+    mismatched = sorted(
+        key for key in set(expected).intersection(normalized)
+        if expected[key].shape != normalized[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise RuntimeError(
+            "trained predictor checkpoint mismatch: "
+            f"missing={missing}, unexpected={unexpected}, shape_mismatch={mismatched}"
+        )
+    predictor.load_state_dict(normalized, strict=True)
+
+
 def init_model(
     device,
     pretrained,
@@ -523,6 +557,8 @@ def init_model(
     pred_depth=12,
     num_mask_tokens=2,
     is_mae=False,
+    optical_qkv=None,
+    predictor_checkpoint=None,
 ):
     if is_mae:
         
@@ -586,4 +622,14 @@ def init_model(
         pred_checkpoint_key=pred_checkpoint_key,
         is_mae=is_mae,
         )
+    optical_qkv = optical_qkv or {}
+    if optical_qkv.get("qkv_backend") == "fsonn_tdm":
+        optical_config = OpticalQKVConfig.from_mapping(optical_qkv)
+        vit_pred.install_optical_qkv(
+            predictor,
+            optical_config=optical_config,
+            replace_layers=optical_qkv.get("replace_layers", "all"),
+        )
+    if predictor_checkpoint is not None:
+        _load_trained_predictor(predictor, predictor_checkpoint)
     return encoder,target_encoder, predictor

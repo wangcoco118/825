@@ -34,9 +34,11 @@ data_split:
   split_seed: 42
 
 training:
+  mode: end_to_end_jepa
   epochs: 50
   max_steps: null
   last_output: null
+  clip_grad: 10.0
 
 optical_qkv:
   enabled: true
@@ -72,3 +74,24 @@ nodes: 1
 tasks_per_node: 1
 eval_name: intuitive_physics
 dataset: intphys
+
+loss:
+  loss_exp: 1.0
+  reg_coeff: 0.0
+
+evaluation:
+  run_after_training: true
+
+mask:
+  - aspect_ratio: [0.75, 1.5]
+    num_blocks: 8
+    spatial_scale: [0.15, 0.15]
+    temporal_scale: [1.0, 1.0]
+    max_temporal_keep: 1.0
+    max_keep: null
+  - aspect_ratio: [0.75, 1.5]
+    num_blocks: 2
+    spatial_scale: [0.7, 0.7]
+    temporal_scale: [1.0, 1.0]
+    max_temporal_keep: 1.0
+    max_keep: null

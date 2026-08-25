@@ -198,6 +198,7 @@ def main(args_eval, resume_preempt=False):
     pred_is_causal = args_pretrain.get('pred_is_causal', False)
     pred_depth = args_pretrain.get('pred_depth', 12)
     optical_qkv = args_eval.get('optical_qkv', {})
+    predictor_checkpoint = args_eval.get("predictor_checkpoint")
     pretrained_path = os.path.join(pretrain_folder, ckp_fname)
     # [for Video model]:
     tubelet_size = args_pretrain.get('tubelet_size', 2)
@@ -245,7 +246,7 @@ def main(args_eval, resume_preempt=False):
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
 
     # -- log/checkpointing paths
-    folder = os.path.join(pretrain_folder, 'intuitive_physics/')
+    folder = args_eval.get("output_dir") or os.path.join(pretrain_folder, 'intuitive_physics/')
     if eval_tag is not None:
         folder = os.path.join(folder, f"{dataset}-{eval_tag}")
     if not os.path.exists(folder):
@@ -280,7 +281,8 @@ def main(args_eval, resume_preempt=False):
         wide_SiLU=wide_SiLU,
         use_sdpa=use_sdpa,
         is_mae=is_mae,
-        optical_qkv=optical_qkv)
+        optical_qkv=optical_qkv,
+        predictor_checkpoint=predictor_checkpoint)
 
     if not is_mae:
         target_encoder.eval()
@@ -938,6 +940,7 @@ def init_model(
     num_mask_tokens=2,
     is_mae=False,
     optical_qkv=None,
+    predictor_checkpoint=None,
 ):
     if is_mae:
 
@@ -1019,5 +1022,18 @@ def init_model(
             predictor,
             optical_config=optical_config,
             replace_layers=replace_layers,
+        )
+    if predictor_checkpoint is not None:
+        checkpoint = torch.load(
+            predictor_checkpoint, map_location="cpu", weights_only=False
+        )
+        if checkpoint.get("mode") != "end_to_end_jepa":
+            raise ValueError(
+                "trained Predictor checkpoint must have mode=end_to_end_jepa"
+            )
+        if "predictor" not in checkpoint:
+            raise ValueError("trained Predictor checkpoint has no full Predictor state")
+        _load_state_dict_checked(
+            predictor, checkpoint["predictor"], "trained predictor"
         )
     return encoder,target_encoder, predictor

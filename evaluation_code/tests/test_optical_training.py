@@ -10,7 +10,11 @@ from PIL import Image
 from evals.intuitive_physics.intphys_dataset import IntPhysDataset
 from evals.intuitive_physics.train_optical import (
     _apply_cli_overrides,
+    _compute_jepa_loss,
+    _end_to_end_checkpoint,
+    _extract_jepa_clips,
     _last_checkpoint_path,
+    _load_end_to_end_checkpoint,
     _save_checkpoint,
 )
 from evals.intuitive_physics.optical_split import (
@@ -67,6 +71,46 @@ class CliOverrideTests(unittest.TestCase):
         config = {"data": {"batch_size": 20}}
         updated = _apply_cli_overrides(config, batch_size=5)
         self.assertEqual(updated["data"]["batch_size"], 5)
+
+
+class JepaLossTests(unittest.TestCase):
+    def test_jepa_loss_matches_official_mean_absolute_formula(self):
+        predictions = [torch.tensor([[1.0, 3.0]]), torch.tensor([[2.0, 8.0]])]
+        targets = [torch.tensor([[0.0, 1.0]]), torch.tensor([[4.0, 4.0]])]
+        expected = torch.tensor((1.5 + 3.0) / 2.0)
+        actual = _compute_jepa_loss(predictions, targets, loss_exp=1.0)
+        self.assertTrue(torch.allclose(actual, expected))
+
+
+class EndToEndJepaTests(unittest.TestCase):
+    def test_one_video_batch_is_one_16_frame_clip(self):
+        clips = torch.zeros(2, 1, 3, 16, 4, 4)
+        labels = torch.zeros(2, 1)
+        actual = _extract_jepa_clips((clips, labels), torch.device("cpu"))
+        self.assertEqual(tuple(actual.shape), (2, 3, 16, 4, 4))
+
+    def test_full_predictor_checkpoint_is_distinct_from_legacy_checkpoint(self):
+        predictor = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(predictor.parameters(), lr=1e-3)
+        config = {
+            "pretrain": {"folder": "/checkpoint", "checkpoint": "official.pt"},
+            "training": {"mode": "end_to_end_jepa"},
+            "optical_qkv": {"qkv_backend": "fsonn_tdm"},
+        }
+        split = {"train_video_ids": ["a"], "val_video_ids": ["b"]}
+        checkpoint = _end_to_end_checkpoint(
+            predictor, optimizer, None, 1, 1, 0.5, split,
+            "/tmp/split.json", config, "best"
+        )
+        self.assertEqual(checkpoint["mode"], "end_to_end_jepa")
+        self.assertEqual(set(checkpoint["predictor"]), set(predictor.state_dict()))
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / "optical_best.pt"
+            torch.save({"optical_state_dict": {}}, legacy)
+            with self.assertRaisesRegex(ValueError, "end_to_end_jepa"):
+                _load_end_to_end_checkpoint(
+                    legacy, predictor, optimizer, None
+                )
 
 
 class CheckpointTests(unittest.TestCase):
