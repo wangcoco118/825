@@ -142,8 +142,24 @@ def _prepare_models(args_eval, device):
     )
 
 
-def _make_loader(args_eval, video_ids, world_size=1, rank=0):
+def _get_training_sampling_rate(args_eval):
     data_cfg = args_eval["data"]
+    sampling_rate = data_cfg.get("sampling_rate")
+    if sampling_rate is None:
+        sampling_rate = args_eval.get("pretrain", {}).get("sampling_rate", 4)
+    if isinstance(sampling_rate, list):
+        sampling_rate = sampling_rate[0]
+    sampling_rate = int(sampling_rate)
+    if sampling_rate <= 0:
+        raise ValueError("sampling_rate must be positive")
+    return sampling_rate
+
+
+def _make_loader(args_eval, video_ids, deterministic=False, world_size=1, rank=0):
+    data_cfg = args_eval["data"]
+    frames_per_clip = int(data_cfg.get("frames_per_clip", 16))
+    if frames_per_clip != 16:
+        raise ValueError("optical distillation training requires frames_per_clip=16")
     transform = make_transforms(
         random_horizontal_flip=False,
         random_resize_aspect_ratio=[1.0, 1.0],
@@ -164,9 +180,9 @@ def _make_loader(args_eval, video_ids, world_size=1, rank=0):
         world_size=world_size,
         rank=rank,
         root_path=get_dataset_paths([data_name])[0],
-        clip_len=99,
-        frame_sample_rate=data_cfg.get("frame_steps", 2),
-        deterministic=False,
+        clip_len=frames_per_clip,
+        frame_sample_rate=_get_training_sampling_rate(args_eval),
+        deterministic=deterministic,
         log_dir=None,
         video_ids=video_ids,
         train_format=True,
@@ -188,13 +204,13 @@ def _extract_train_clips(batch, device):
 
 def _prepare_features(batch, args_eval, encoder, target_encoder, device):
     clips = _extract_train_clips(batch, device)
-    frame_step = args_eval["data"].get("frame_steps", 2)
-    if isinstance(frame_step, list):
-        frame_step = frame_step[0]
     frames_per_clip = args_eval["data"].get("frames_per_clip", 16)
-    pieces = clips.unfold(2, frames_per_clip, frame_step)
-    pieces = pieces.permute(0, 2, -1, 1, 3, 4).contiguous()
-    pieces = pieces.flatten(0, 1).permute(0, 2, 1, 3, 4).contiguous()
+    if clips.ndim != 5 or clips.shape[1] != 3 or clips.shape[2] != frames_per_clip:
+        raise ValueError(
+            "optical distillation expects [B,3,16,H,W], "
+            f"got {tuple(clips.shape)}"
+        )
+    pieces = clips.contiguous()
     batch_size = pieces.shape[0]
 
     context_length = args_eval["data"].get("context_lengths", [2])[0]
@@ -414,8 +430,12 @@ def run(
         lr=learning_rate,
     )
     loader_started = time.perf_counter()
-    train_loader = _make_loader(args_eval, split["train_video_ids"])
-    val_loader = _make_loader(args_eval, split["val_video_ids"])
+    train_loader = _make_loader(
+        args_eval, split["train_video_ids"], deterministic=False
+    )
+    val_loader = _make_loader(
+        args_eval, split["val_video_ids"], deterministic=True
+    )
     logger.info(
         "data_loaders_ready elapsed_s=%.3f batch_size=%s train_batches=%d "
         "val_batches=%d",

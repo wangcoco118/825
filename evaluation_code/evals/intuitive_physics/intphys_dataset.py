@@ -48,7 +48,8 @@ def make_videodataset(
         shared_transform=shared_transform,
         transform=transform,
         video_ids=video_ids,
-        train_format=train_format)
+        train_format=train_format,
+        deterministic=deterministic)
     
     logger.info('Dataset created')
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -85,6 +86,7 @@ class IntPhysDataset(torch.utils.data.Dataset):
         shared_transform=None,
         video_ids=None,
         train_format=False,
+        deterministic=True,
     ):
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
@@ -92,6 +94,7 @@ class IntPhysDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.shared_transform = shared_transform
         self.train_format = train_format
+        self.deterministic = deterministic
 
         self.scenes = (
             [str(video_id) for video_id in video_ids]
@@ -112,7 +115,7 @@ class IntPhysDataset(torch.utils.data.Dataset):
                 os.listdir(f"{self.data_path}/{scene}/scene")
             )
             max_start = len(frames_all) - self.length_clip
-            start = (
+            start = 0 if self.deterministic else (
                 0
                 if self.length_clip > 90 or max_start <= 0
                 else np.random.randint(0, max_start + 1)
