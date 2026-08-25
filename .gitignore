@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Environments
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Training outputs
+logs/
+runs/
+outputs/
+checkpoints/
+wandb/
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+*.pth.tar
+
+# Dataset / generated data
+data/
+datasets/
+
+# Temporary files
+*.log
+*.tmp

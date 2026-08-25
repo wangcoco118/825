@@ -1,0 +1,74 @@
+
+# V-JEPA Intuitive Physics optical QKV distillation configuration.
+pretrain:
+  enc_checkpoint_key: encoder
+  pred_checkpoint_key: predictor
+  model_name: vit_large
+  patch_size: 16
+  folder: /data/linux/wkx/IntPhys/references_code/references/checkpoints/vjepa
+  checkpoint: vitl16.pth.tar
+  write_tag: vjepa_vitl16_fsonn_tdm
+  use_sdpa: true
+  use_silu: false
+  wide_silu: false
+  uniform_power: true
+  is_causal: false
+  pred_is_causal: false
+  pred_depth: 12
+  tubelet_size: 2
+  frames_per_clip: 16
+
+data:
+  batch_size: 20
+  resolution: 224
+  stride_sliding_window: 2
+  use_bfloat16: true
+  frames_per_clip: 16
+  context_lengths: [2, 4, 6, 8, 10]
+  frame_steps: 2
+
+data_split:
+  source: train
+  num_train_videos: 800
+  num_val_videos: 100
+  split_seed: 42
+
+training:
+  epochs: 50
+  max_steps: null
+  last_output: null
+
+optical_qkv:
+  enabled: true
+  qkv_backend: fsonn_tdm
+  replace_layers: all
+  num_time_slots: 3
+  token_chunk_size: 523
+  input_dim: 384
+  qkv_output_dim: 1152
+  grid_height: 523
+  grid_width: 1152
+  pixel_pitch_um: 8.0
+  wavelength_nm: 532.0
+  num_slm_layers: 3
+  slm_intervals_um: [50000.0, 50000.0]
+  input_to_first_slm_um: 50000.0
+  last_slm_to_positive_detector_um: 50000.0
+  differential_detector_gap_um: 5000.0
+  detector_split_ratio: 0.5
+  propagation_method: band_limited_asm
+  asm_padding_factor: 2.0
+  input_encoding_mode: signed_phase
+  input_scale_mode: per_block_trainable_positive
+  readout_calibration_mode: positive_per_channel_gain
+  add_original_qkv_bias: false
+  readout_additive_bias: false
+  distill_target: attention_proj_output_pre_residual
+  attention_nmse_weight: 1.0
+  noise_enabled: false
+
+tag: vjepa_vitl16_fsonn_tdm
+nodes: 1
+tasks_per_node: 1
+eval_name: intuitive_physics
+dataset: intphys
