@@ -35,6 +35,7 @@ import torch.distributed as dist
 
 
 from src.utils.tensors import repeat_interleave_batch
+from src.utils.amp import autocast_context
 from src.masks.utils import apply_masks
 import src.models.vision_transformer as vit
 import src.models.predictor as vit_pred
@@ -351,7 +352,7 @@ def extract_losses(
                 masks_pred = [m_.repeat(B, 1)]
                 full_mask = [full_m.repeat(B, 1)]
 
-            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+            with autocast_context(device, use_bfloat16):
                 if is_mae: 
                     if mae_decoder_blocks == -1:
                         mean = torch.as_tensor((0.485, 0.456, 0.406)).to(device)[None, :, None, None, None]

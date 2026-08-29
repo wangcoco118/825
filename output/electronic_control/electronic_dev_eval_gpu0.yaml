@@ -1,0 +1,92 @@
+pretrain:
+  enc_checkpoint_key: encoder
+  pred_checkpoint_key: predictor
+  model_name: vit_large
+  patch_size: 16
+  folder: /data/linux/wkx/IntPhys/references_code/references/checkpoints/vjepa
+  checkpoint: vitl16.pth.tar
+  write_tag: vjepa_vitl16_fsonn_tdm
+  use_sdpa: true
+  use_silu: false
+  wide_silu: false
+  uniform_power: true
+  is_causal: false
+  pred_is_causal: false
+  pred_depth: 12
+  tubelet_size: 2
+  frames_per_clip: 16
+data:
+  batch_size: 1
+  resolution: 224
+  stride_sliding_window: 2
+  use_bfloat16: true
+  frames_per_clip: 16
+  context_lengths:
+  - 2
+  - 4
+  - 6
+  - 8
+  - 10
+  frame_steps:
+  - 2
+  - 4
+  - 6
+  - 8
+  - 10
+data_split:
+  source: train
+  num_train_videos: 800
+  num_val_videos: 100
+  split_seed: 42
+training:
+  mode: end_to_end_jepa
+  experiment_mode: optical_qkv
+  epochs: 50
+distillation:
+  enabled: false
+  target_node: qkv
+  optimization_scope: last_layer
+  log_all_layers: true
+  cosine_loss_weight: 0.1
+  max_steps: null
+  last_output: null
+  clip_grad: 10.0
+optical_qkv: {}
+tag: vjepa_vitl16_fsonn_tdm
+nodes: 1
+tasks_per_node: 1
+eval_name: intuitive_physics
+dataset: intphys
+loss:
+  loss_exp: 1.0
+  reg_coeff: 0.0
+evaluation:
+  run_after_training: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+  max_temporal_keep: 1.0
+  max_keep: null
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+  max_temporal_keep: 1.0
+  max_keep: null
+predictor_checkpoint: /data/linux/wkx/IntPhys/references_code/jepa_onn/output/electronic_control_20260825_212433/electronic_control.pt
+output_dir: /data/linux/wkx/IntPhys/references_code/jepa_onn/output/electronic_control_20260825_212433/intphys_full_eval_gpu0
+mode: all

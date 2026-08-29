@@ -67,8 +67,8 @@ class OpticalQKVConfig:
         )
         if any(value <= 0 for value in positive):
             raise ValueError("optical dimensions, distances, and sampling values must be positive")
-        if self.num_slm_layers != 3:
-            raise ValueError("the first implementation requires exactly three phase SLM layers")
+        if self.num_slm_layers < 1:
+            raise ValueError("num_slm_layers must be positive")
         if self.qkv_output_dim != 3 * self.input_dim:
             raise ValueError("qkv_output_dim must equal 3 * input_dim")
         if self.grid_height != self.token_chunk_size:

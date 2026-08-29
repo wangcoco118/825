@@ -35,11 +35,13 @@ import torch.distributed as dist
 
 
 from src.utils.tensors import repeat_interleave_batch
+from src.utils.amp import autocast_context
 from src.masks.utils import apply_masks
 import src.models.vision_transformer as vit
 import src.models.predictor as vit_pred
 from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
 from src.models.fsonn import OpticalQKVConfig
+from src.models.optical_distillation import load_optical_checkpoint
 from evals.intuitive_physics.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
 from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
@@ -740,7 +742,7 @@ def extract_losses(
                 masks_pred = [m_.repeat(B, 1)]
                 full_mask = [full_m.repeat(B, 1)]
 
-            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+            with autocast_context(device, use_bfloat16):
                 if is_mae:
                     if mae_decoder_blocks == -1:
                         mean = torch.as_tensor((0.485, 0.456, 0.406)).to(device)[None, :, None, None, None]
@@ -917,6 +919,10 @@ def load_pretrained(
     return encoder,target_encoder, predictor
 
 
+def _is_full_predictor_checkpoint_mode(checkpoint_mode):
+    return checkpoint_mode in {"end_to_end_jepa", "electronic_control"}
+
+
 def init_model(
     device,
     pretrained,
@@ -1027,13 +1033,25 @@ def init_model(
         checkpoint = torch.load(
             predictor_checkpoint, map_location="cpu", weights_only=False
         )
-        if checkpoint.get("mode") != "end_to_end_jepa":
-            raise ValueError(
-                "trained Predictor checkpoint must have mode=end_to_end_jepa"
+        checkpoint_mode = checkpoint.get("mode")
+        if checkpoint_mode == "realtime_last_node_distillation":
+            if qkv_backend != "fsonn_tdm":
+                raise ValueError(
+                    "realtime optical checkpoint requires qkv_backend=fsonn_tdm"
+                )
+            load_optical_checkpoint(predictor, checkpoint)
+        else:
+            if not _is_full_predictor_checkpoint_mode(checkpoint_mode):
+                raise ValueError(
+                    "trained Predictor checkpoint must have mode=end_to_end_jepa "
+                    "or mode=electronic_control "
+                    "or mode=realtime_last_node_distillation"
+                )
+            if "predictor" not in checkpoint:
+                raise ValueError(
+                    "trained Predictor checkpoint has no full Predictor state"
+                )
+            _load_state_dict_checked(
+                predictor, checkpoint["predictor"], "trained predictor"
             )
-        if "predictor" not in checkpoint:
-            raise ValueError("trained Predictor checkpoint has no full Predictor state")
-        _load_state_dict_checked(
-            predictor, checkpoint["predictor"], "trained predictor"
-        )
     return encoder,target_encoder, predictor

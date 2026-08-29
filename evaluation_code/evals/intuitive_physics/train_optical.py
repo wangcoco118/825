@@ -23,8 +23,7 @@ from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
 from src.models.fsonn import OpticalQKVConfig
 from src.models.optical_distillation import (
     build_optical_checkpoint,
-    independent_block_distillation_loss,
-    independent_block_distillation_step,
+    freeze_stage_one,
     optical_parameters,
 )
 from evals.intuitive_physics.data_manager import init_data
@@ -64,6 +63,12 @@ def _configure_logging(log_path):
 def _sync_for_timing(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _format_progress(step, total_steps):
+    total_steps = max(int(total_steps), 1)
+    step = min(max(int(step), 0), total_steps)
+    return f"step={step}/{total_steps} progress={step / total_steps * 100.0:.1f}%"
 
 
 def _last_checkpoint_path(output_path):
@@ -120,12 +125,113 @@ def _load_config(path):
         return yaml.safe_load(handle)
 
 
-def _apply_cli_overrides(config, batch_size=None):
+def _apply_cli_overrides(config, batch_size=None, target_node=None):
     if batch_size is not None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         config.setdefault("data", {})["batch_size"] = int(batch_size)
+    if target_node is not None:
+        config.setdefault("distillation", {})["target_node"] = target_node
     return config
+
+
+def _resolve_experiment_mode(args_eval):
+    training_cfg = args_eval.get("training", {})
+    configured = training_cfg.get("experiment_mode")
+    if configured is None:
+        configured = training_cfg.get("mode", "end_to_end_jepa")
+    legacy_mapping = {
+        "end_to_end_jepa": "optical_qkv",
+        "qkv_distill": "realtime_last_node_distillation",
+    }
+    mode = legacy_mapping.get(configured, configured)
+    if mode not in {
+        "electronic_control",
+        "optical_qkv",
+        "realtime_last_node_distillation",
+    }:
+        raise ValueError(f"unsupported experiment mode: {mode}")
+    if (
+        bool(args_eval.get("distillation", {}).get("enabled", False))
+        and mode != "realtime_last_node_distillation"
+    ):
+        raise ValueError(
+            "distillation.enabled=true requires "
+            "training.experiment_mode=realtime_last_node_distillation"
+        )
+    return mode
+
+
+_DISTILLATION_NODES = (
+    "qkv",
+    "attention_output",
+    "post_output",
+    "block_output",
+    "predictor_output",
+)
+
+
+def _resolve_distillation_config(args_eval):
+    distill_cfg = copy.deepcopy(args_eval.get("distillation", {}))
+    target_node = distill_cfg.get("target_node", "qkv")
+    if target_node not in _DISTILLATION_NODES:
+        raise ValueError(
+            f"distillation.target_node must be one of {_DISTILLATION_NODES}, "
+            f"got {target_node}"
+        )
+    optimization_scope = distill_cfg.get("optimization_scope", "last_layer")
+    if optimization_scope != "last_layer":
+        raise ValueError(
+            "realtime_last_node_distillation only supports "
+            "distillation.optimization_scope=last_layer"
+        )
+    cosine_loss_weight = float(distill_cfg.get("cosine_loss_weight", 0.1))
+    if cosine_loss_weight < 0:
+        raise ValueError("distillation.cosine_loss_weight must be non-negative")
+    return {
+        "enabled": True,
+        "target_node": target_node,
+        "optimization_scope": optimization_scope,
+        "log_all_layers": bool(distill_cfg.get("log_all_layers", True)),
+        "cosine_loss_weight": cosine_loss_weight,
+    }
+
+
+def _should_run_internal_validation(args_eval):
+    return _resolve_experiment_mode(args_eval) != (
+        "realtime_last_node_distillation"
+    )
+
+
+def _compute_distillation_loss(
+    student,
+    teacher,
+    cosine_loss_weight=0.1,
+    eps=1e-6,
+):
+    if student.shape != teacher.shape:
+        raise ValueError(
+            f"student and teacher shapes must match, got "
+            f"{tuple(student.shape)} and {tuple(teacher.shape)}"
+        )
+    if student.ndim < 2:
+        raise ValueError("distillation tensors must include a feature dimension")
+    feature_dim = student.shape[-1]
+    student_flat = student.reshape(-1, feature_dim)
+    teacher_flat = teacher.reshape(-1, feature_dim)
+    diff = student_flat - teacher_flat
+    nmse = (
+        diff.square().sum(dim=-1)
+        / teacher_flat.square().sum(dim=-1).clamp_min(float(eps))
+    ).mean()
+    cosine = (
+        1.0
+        - F.cosine_similarity(
+            student_flat, teacher_flat, dim=-1, eps=float(eps)
+        )
+    ).mean()
+    total = nmse + float(cosine_loss_weight) * cosine
+    return total, nmse, cosine
 
 
 def _compute_jepa_loss(predictions, targets, loss_exp=1.0):
@@ -180,10 +286,13 @@ def _prepare_models(args_eval, device):
         replace_layers=replace_layers,
     )
 
-    for module in (encoder, target_encoder, teacher_predictor):
+    for module in (encoder, target_encoder, teacher_predictor, student_predictor):
         module.eval()
         for parameter in module.parameters():
-            parameter.requires_grad = False
+            parameter.requires_grad_(False)
+    freeze_stage_one(student_predictor)
+    if not list(optical_parameters(student_predictor)):
+        raise RuntimeError("realtime distillation requires trainable optical parameters")
     return (
         encoder,
         target_encoder,
@@ -286,6 +395,53 @@ def _prepare_features(batch, args_eval, encoder, target_encoder, device):
     return context, targets, masks_ctxt, masks_tgt, pieces.shape[0]
 
 
+def _predictor_core(predictor):
+    return predictor.backbone if hasattr(predictor, "backbone") else predictor
+
+
+def _forward_predictor_with_nodes(
+    predictor,
+    context,
+    targets,
+    masks_ctxt,
+    masks_tgt,
+    target_node,
+    qkv_include_bias=True,
+):
+    core = _predictor_core(predictor)
+    if isinstance(context, (list, tuple)):
+        context = context[0]
+    if isinstance(targets, (list, tuple)):
+        targets = targets[0]
+    return core.forward_with_nodes(
+        context,
+        targets,
+        masks_ctxt,
+        masks_tgt,
+        target_node=target_node,
+        qkv_include_bias=qkv_include_bias,
+    )
+
+
+def _optical_gradient_norms(student_predictor):
+    norms = {}
+    core = _predictor_core(student_predictor)
+    for name, parameter in core.named_parameters():
+        if "optical_qkv" not in name or parameter.grad is None:
+            continue
+        parts = name.split(".")
+        try:
+            block_index = int(parts[1])
+        except (IndexError, ValueError):
+            block_index = -1
+        value = parameter.grad.detach().float().square().sum()
+        norms[block_index] = norms.get(block_index, 0.0) + float(value)
+    return {
+        index: value ** 0.5
+        for index, value in sorted(norms.items())
+    }
+
+
 def _run_epoch(
     loader,
     args_eval,
@@ -300,107 +456,209 @@ def _run_epoch(
     epoch,
     training,
     max_steps=None,
+    clip_grad=10.0,
+    stage_name=None,
 ):
-    stage = "train" if training else "val"
-    if training:
-        student_predictor.train()
-    else:
-        student_predictor.eval()
-        teacher_predictor.eval()
+    stage = stage_name or ("train" if training else "val")
+    distill_cfg = _resolve_distillation_config(args_eval)
+    target_node = distill_cfg["target_node"]
+    student_predictor.eval()
+    teacher_predictor.eval()
+    encoder.eval()
+    target_encoder.eval()
+    depth = len(_predictor_core(student_predictor).predictor_blocks)
+    last_block = depth - 1
+    if not replace_layers:
+        raise ValueError("realtime distillation requires at least one optical block")
 
-    total_sum = 0.0
-    block_sums = {int(index): 0.0 for index in replace_layers}
+    total_loss = 0.0
+    total_nmse = 0.0
+    total_cosine = 0.0
+    layer_loss_sum = {}
+    layer_nmse_sum = {}
+    layer_cosine_sum = {}
     batches = 0
-    stage_started = time.perf_counter()
+    started = time.perf_counter()
+    stage_total = len(loader)
+    if max_steps is not None:
+        stage_total = min(stage_total, max_steps)
 
     for batch_index, batch in enumerate(loader):
         if max_steps is not None and batch_index >= max_steps:
             break
         step_started = time.perf_counter()
-        feature_started = time.perf_counter()
         context, targets, masks_ctxt, masks_tgt, batch_size = _prepare_features(
             batch, args_eval, encoder, target_encoder, device
         )
-        _sync_for_timing(device)
-        feature_time = time.perf_counter() - feature_started
 
-        distill_started = time.perf_counter()
-        if training:
-            total_loss, block_losses = independent_block_distillation_step(
+        teacher_started = time.perf_counter()
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else None
+        )
+        with torch.no_grad():
+            _, teacher_nodes = _forward_predictor_with_nodes(
                 teacher_predictor,
+                context,
+                targets,
+                masks_ctxt,
+                masks_tgt,
+                target_node,
+                qkv_include_bias=(target_node != "qkv"),
+            )
+        _sync_for_timing(device)
+        teacher_time = time.perf_counter() - teacher_started
+        torch.set_rng_state(cpu_rng_state)
+        if device.type == "cuda" and cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, device=device)
+
+        student_started = time.perf_counter()
+        if training:
+            _, student_nodes = _forward_predictor_with_nodes(
                 student_predictor,
                 context,
                 targets,
                 masks_ctxt,
                 masks_tgt,
-                replace_layers,
-                optimizer,
+                target_node,
+                qkv_include_bias=True,
             )
         else:
             with torch.no_grad():
-                total_loss, block_losses = independent_block_distillation_loss(
-                    teacher_predictor,
+                _, student_nodes = _forward_predictor_with_nodes(
                     student_predictor,
                     context,
                     targets,
                     masks_ctxt,
                     masks_tgt,
-                    replace_layers,
+                    target_node,
+                    qkv_include_bias=True,
                 )
-            total_loss = total_loss.detach()
-            block_losses = {
-                index: value.detach() for index, value in block_losses.items()
-            }
         _sync_for_timing(device)
-        distill_time = time.perf_counter() - distill_started
+        student_time = time.perf_counter() - student_started
 
-        total_value = float(total_loss)
-        total_sum += total_value
-        for index, value in block_losses.items():
-            block_sums[int(index)] += float(value)
+        if target_node == "predictor_output":
+            train_loss, train_nmse, train_cosine = _compute_distillation_loss(
+                student_nodes[target_node],
+                teacher_nodes[target_node],
+                cosine_loss_weight=distill_cfg["cosine_loss_weight"],
+            )
+            current_layer_losses = {}
+            current_layer_nmse = {}
+            current_layer_cosine = {}
+        else:
+            student_layer_nodes = student_nodes[target_node]
+            teacher_layer_nodes = teacher_nodes[target_node]
+            if len(student_layer_nodes) != depth or len(teacher_layer_nodes) != depth:
+                raise RuntimeError(
+                    f"{target_node} must produce one node per Block; "
+                    f"got student={len(student_layer_nodes)} teacher={len(teacher_layer_nodes)} "
+                    f"depth={depth}"
+                )
+            current_layer_losses = {}
+            current_layer_nmse = {}
+            current_layer_cosine = {}
+            last_loss = None
+            last_nmse = None
+            last_cosine = None
+            for block_index, (student_node, teacher_node) in enumerate(
+                zip(student_layer_nodes, teacher_layer_nodes)
+            ):
+                loss, nmse, cosine = _compute_distillation_loss(
+                    student_node,
+                    teacher_node,
+                    cosine_loss_weight=distill_cfg["cosine_loss_weight"],
+                )
+                current_layer_losses[block_index] = float(loss.detach())
+                current_layer_nmse[block_index] = float(nmse.detach())
+                current_layer_cosine[block_index] = float(cosine.detach())
+                if block_index == last_block:
+                    last_loss = loss
+                    last_nmse = nmse
+                    last_cosine = cosine
+            train_loss = last_loss
+            train_nmse = last_nmse
+            train_cosine = last_cosine
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+            train_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(optical_parameters(student_predictor)),
+                float(clip_grad),
+            )
+            gradient_norms = _optical_gradient_norms(student_predictor)
+            optimizer.step()
+        else:
+            grad_norm = torch.tensor(0.0, device=device)
+            gradient_norms = {}
+
+        loss_value = float(train_loss.detach())
+        nmse_value = float(train_nmse.detach())
+        cosine_value = float(train_cosine.detach())
+        total_loss += loss_value
+        total_nmse += nmse_value
+        total_cosine += cosine_value
+        for index, value in current_layer_losses.items():
+            layer_loss_sum[index] = layer_loss_sum.get(index, 0.0) + value
+            layer_nmse_sum[index] = layer_nmse_sum.get(index, 0.0) + current_layer_nmse[index]
+            layer_cosine_sum[index] = layer_cosine_sum.get(index, 0.0) + current_layer_cosine[index]
         batches += 1
         logger.info(
-            "epoch=%d stage=%s step=%d batch_size=%d total_nmse=%.6f "
-            "block_nmse={%s} feature_time_s=%.3f distill_time_s=%.3f "
-            "step_time_s=%.3f",
+            "epoch=%d stage=%s %s target_node=%s last_block=%d "
+            "batch_size=%d loss=%.6f nmse=%.6f cosine=%.6f "
+            "teacher_time_s=%.3f student_time_s=%.3f elapsed_s=%.3f "
+            "grad_norm=%.3f optical_grad_norms={%s} layer_nmse={%s}",
             epoch,
             stage,
-            batches,
+            _format_progress(batches, stage_total),
+            target_node,
+            last_block,
             batch_size,
-            total_value,
-            ",".join(
-                f"{index}:{float(value):.6f}"
-                for index, value in block_losses.items()
-            ),
-            feature_time,
-            distill_time,
+            loss_value,
+            nmse_value,
+            cosine_value,
+            teacher_time,
+            student_time,
             time.perf_counter() - step_started,
+            float(grad_norm),
+            ",".join(f"{i}:{v:.6f}" for i, v in gradient_norms.items()),
+            ",".join(f"{i}:{v:.6f}" for i, v in current_layer_nmse.items()),
         )
 
     if batches == 0:
         raise RuntimeError(f"{stage} loader produced no batches")
     metrics = {
-        "total_nmse": total_sum / batches,
-        "block_nmse": {
-            index: value / batches for index, value in block_sums.items()
-        },
+        "train_loss": total_loss / batches,
+        "train_nmse": total_nmse / batches,
+        "train_cosine": total_cosine / batches,
+        "layer_loss": {i: v / batches for i, v in layer_loss_sum.items()},
+        "layer_nmse": {i: v / batches for i, v in layer_nmse_sum.items()},
+        "layer_cosine": {i: v / batches for i, v in layer_cosine_sum.items()},
         "batches": batches,
-        "elapsed_s": time.perf_counter() - stage_started,
+        "elapsed_s": time.perf_counter() - started,
+        "last_block": last_block,
+        "target_node": target_node,
     }
     logger.info(
-        "epoch=%d stage=%s_done batches=%d total_nmse=%.6f block_nmse={%s} "
-        "stage_time_s=%.3f",
+        "epoch=%d stage=%s_done target_node=%s last_block=%d batches=%d "
+        "loss=%.6f nmse=%.6f cosine=%.6f layer_nmse={%s} "
+        "elapsed_s=%.3f",
         epoch,
         stage,
+        target_node,
+        last_block,
         batches,
-        metrics["total_nmse"],
-        ",".join(
-            f"{index}:{value:.6f}"
-            for index, value in metrics["block_nmse"].items()
-        ),
+        metrics["train_loss"],
+        metrics["train_nmse"],
+        metrics["train_cosine"],
+        ",".join(f"{i}:{v:.6f}" for i, v in metrics["layer_nmse"].items()),
         metrics["elapsed_s"],
     )
     return metrics
+
 
 
 def _default_jepa_mask_config():
@@ -540,14 +798,24 @@ def _prepare_jepa_batch(batch, args_eval, encoder, target_encoder, device):
     return clips, context, targets, masks_ctxt, masks_tgt
 
 
-def _prepare_end_to_end_models(args_eval, device):
+def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv"):
     optical_cfg = args_eval.get("optical_qkv", {})
-    if optical_cfg.get("qkv_backend") != "fsonn_tdm":
-        raise ValueError("end_to_end_jepa requires optical_qkv.qkv_backend=fsonn_tdm")
-    optical_config = OpticalQKVConfig.from_mapping(optical_cfg)
-    replace_layers = optical_cfg.get("replace_layers", "all")
-    if replace_layers == "all":
-        replace_layers = list(range(args_eval["pretrain"].get("pred_depth", 12)))
+    if experiment_mode == "optical_qkv":
+        if optical_cfg.get("qkv_backend") != "fsonn_tdm":
+            raise ValueError(
+                "optical_qkv requires optical_qkv.qkv_backend=fsonn_tdm"
+            )
+        optical_config = OpticalQKVConfig.from_mapping(optical_cfg)
+        replace_layers = optical_cfg.get("replace_layers", "all")
+        if replace_layers == "all":
+            replace_layers = list(range(args_eval["pretrain"].get("pred_depth", 12)))
+    elif experiment_mode == "electronic_control":
+        optical_config = None
+        replace_layers = []
+    else:
+        raise ValueError(
+            f"_prepare_end_to_end_models does not support {experiment_mode}"
+        )
     encoder, target_encoder, predictor = init_model(
         crop_size=args_eval["data"].get("resolution", 224),
         device=device,
@@ -571,11 +839,12 @@ def _prepare_end_to_end_models(args_eval, device):
         is_mae=False,
         optical_qkv={},
     )
-    vit_pred.install_optical_qkv(
-        predictor,
-        optical_config=optical_config,
-        replace_layers=replace_layers,
-    )
+    if experiment_mode == "optical_qkv":
+        vit_pred.install_optical_qkv(
+            predictor,
+            optical_config=optical_config,
+            replace_layers=replace_layers,
+        )
     for module in (encoder, target_encoder):
         module.eval()
         for parameter in module.parameters():
@@ -607,6 +876,9 @@ def _run_jepa_epoch(
     total_loss = 0.0
     batches = 0
     started = time.perf_counter()
+    stage_total = len(loader)
+    if max_steps is not None:
+        stage_total = min(stage_total, max_steps)
     for batch_index, batch in enumerate(loader):
         if max_steps is not None and batch_index >= max_steps:
             break
@@ -645,25 +917,16 @@ def _run_jepa_epoch(
         loss_value = float(loss.detach())
         total_loss += loss_value
         batches += 1
-        gpu_memory = (
-            torch.cuda.memory_allocated(device) / (1024 ** 2)
-            if device.type == "cuda"
-            else 0.0
-        )
         logger.info(
-            "epoch=%d stage=%s step=%d batch_size=%d jepa_loss=%.6f "
-            "feature_time_s=%.3f predictor_time_s=%.3f step_time_s=%.3f "
-            "grad_norm=%.3f gpu_allocated_mib=%.0f",
+            "epoch=%d stage=%s %s batch_size=%d jepa_loss=%.6f "
+            "elapsed_s=%.3f grad_norm=%.3f",
             epoch,
             stage,
-            batches,
+            _format_progress(batches, stage_total),
             clips.shape[0],
             loss_value,
-            feature_time,
-            predictor_time,
             time.perf_counter() - step_started,
             float(grad_norm),
-            gpu_memory,
         )
     if batches == 0:
         raise RuntimeError(f"{stage} loader produced no batches")
@@ -674,7 +937,7 @@ def _run_jepa_epoch(
         "elapsed_s": time.perf_counter() - started,
     }
     logger.info(
-        "epoch=%d stage=%s_done batches=%d jepa_loss=%.6f stage_time_s=%.3f",
+        "epoch=%d stage=%s_done batches=%d jepa_loss=%.6f elapsed_s=%.3f",
         epoch,
         stage,
         batches,
@@ -696,14 +959,21 @@ def _end_to_end_checkpoint(
     args_eval,
     kind,
     best_epoch=None,
+    experiment_mode="optical_qkv",
 ):
     predictor_state = {
         key: value.detach().cpu().clone()
         for key, value in predictor.state_dict().items()
     }
+    checkpoint_mode = (
+        "end_to_end_jepa"
+        if experiment_mode == "optical_qkv"
+        else "electronic_control"
+    )
     return {
         "format_version": 1,
-        "mode": "end_to_end_jepa",
+        "mode": checkpoint_mode,
+        "experiment_mode": experiment_mode,
         "checkpoint_kind": kind,
         "epoch": int(epoch),
         "global_step": int(global_step),
@@ -717,11 +987,21 @@ def _end_to_end_checkpoint(
         "cuda_rng_state_all": (
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
-        "optical_qkv": copy.deepcopy(args_eval.get("optical_qkv", {})),
-        "replace_layers": copy.deepcopy(args_eval.get("optical_qkv", {}).get("replace_layers", "all")),
+        "optical_qkv": (
+            copy.deepcopy(args_eval.get("optical_qkv", {}))
+            if experiment_mode == "optical_qkv"
+            else {}
+        ),
+        "replace_layers": (
+            copy.deepcopy(args_eval.get("optical_qkv", {}).get("replace_layers", "all"))
+            if experiment_mode == "optical_qkv"
+            else []
+        ),
         "pretrain_checkpoint": os.path.join(
             args_eval["pretrain"]["folder"], args_eval["pretrain"]["checkpoint"]
         ),
+        "config_format_version": 1,
+        "config": copy.deepcopy(args_eval),
         "training_config": copy.deepcopy(args_eval.get("training", {})),
         "data_split": copy.deepcopy(split),
         "split_manifest": os.path.abspath(split_manifest),
@@ -733,14 +1013,36 @@ def _load_end_to_end_checkpoint(
     predictor,
     optimizer,
     scheduler,
+    expected_config=None,
+    expected_mode="optical_qkv",
 ):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("mode") != "end_to_end_jepa":
+    saved_mode = checkpoint.get("experiment_mode")
+    if saved_mode is None and checkpoint.get("mode") == "end_to_end_jepa":
+        saved_mode = "optical_qkv"
+    if saved_mode is None:
         raise ValueError(
-            "end_to_end_jepa can resume only from an end_to_end_jepa checkpoint"
+            "end_to_end_jepa/electronic_control can resume only from a "
+            "full end-to-end checkpoint"
+        )
+    if saved_mode != expected_mode:
+        raise ValueError(
+            f"{expected_mode} cannot resume from {saved_mode} checkpoint"
         )
     if "predictor" not in checkpoint or "optimizer" not in checkpoint:
-        raise ValueError("end_to_end_jepa checkpoint is missing full Predictor state")
+        raise ValueError(
+            f"{expected_mode} checkpoint is missing full Predictor state"
+        )
+    saved_config = checkpoint.get("config")
+    if saved_config is None:
+        raise ValueError(
+            f"{expected_mode} checkpoint has no complete config and cannot be "
+            "resumed safely"
+        )
+    if expected_config is not None and saved_config != expected_config:
+        raise ValueError(
+            f"{expected_mode} checkpoint config does not match the current config"
+        )
     predictor.load_state_dict(checkpoint["predictor"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -752,17 +1054,32 @@ def _load_end_to_end_checkpoint(
     return checkpoint
 
 
-def _run_final_intphys_evaluation(args_eval, best_path, run_dir, logger):
+def _run_final_intphys_evaluation(
+    args_eval, best_path, run_dir, logger, dev_only=False
+):
     from evals.intuitive_physics import eval as dev_eval
-    from evals.intphys_test import eval as test_eval
-    for label, module, folder_name in (
-        ("dev", dev_eval, "intphys_dev"),
-        ("test", test_eval, "intphys_test"),
-    ):
+    evaluation_jobs = [("dev", dev_eval, "intphys_dev")]
+    if not dev_only:
+        from evals.intphys_test import eval as test_eval
+        evaluation_jobs.append(("test", test_eval, "intphys_test"))
+    for label, module, folder_name in evaluation_jobs:
         evaluation_cfg = copy.deepcopy(args_eval)
         evaluation_cfg["predictor_checkpoint"] = os.path.abspath(best_path)
         evaluation_cfg["output_dir"] = os.path.join(run_dir, folder_name)
-        logger.info("final_evaluation_start split=%s checkpoint=%s", label, best_path)
+        if label == "dev":
+            evaluation_cfg["dataset"] = "intphys"
+            evaluation_cfg["eval_name"] = "intuitive_physics"
+        else:
+            evaluation_cfg["dataset"] = "intphys-test"
+            evaluation_cfg["eval_name"] = "intphys_test"
+        if _resolve_experiment_mode(args_eval) == "electronic_control":
+            evaluation_cfg["optical_qkv"] = {}
+        logger.info(
+            "final_evaluation_start split=%s dataset=%s checkpoint=%s",
+            label,
+            evaluation_cfg["dataset"],
+            best_path,
+        )
         module.main(evaluation_cfg)
         logger.info("final_evaluation_done split=%s", label)
 
@@ -777,7 +1094,13 @@ def run(
     epochs=None,
     split_manifest=None,
     last_output=None,
+    skip_final_eval=False,
 ):
+    if _resolve_experiment_mode(args_eval) != "realtime_last_node_distillation":
+        raise ValueError(
+            "run() is reserved for realtime_last_node_distillation"
+        )
+    distill_cfg = _resolve_distillation_config(args_eval)
     if log_path is None:
         log_path = f"{output_path}.log"
     logger = _configure_logging(log_path)
@@ -810,12 +1133,18 @@ def run(
         train_root,
         split_manifest,
         num_train_videos=int(split_cfg.get("num_train_videos", 1500)),
-        num_val_videos=int(split_cfg.get("num_val_videos", 300)),
+        num_val_videos=0,
         split_seed=int(split_cfg.get("split_seed", 42)),
     )
+    split["val_video_ids"] = []
+    split["num_val_videos"] = 0
     logger.info(
-        "run_start epochs=%d max_steps=%s learning_rate=%g output=%s log=%s "
-        "device=%s train_videos=%d val_videos=%d split_manifest=%s last_output=%s",
+        "run_start mode=realtime_last_node_distillation target_node=%s "
+        "optimization_scope=%s epochs=%d max_steps=%s learning_rate=%g "
+        "output=%s log=%s device=%s train_videos=%d validation=disabled "
+        "split_manifest=%s",
+        distill_cfg["target_node"],
+        distill_cfg["optimization_scope"],
         epochs,
         max_steps,
         learning_rate,
@@ -823,13 +1152,11 @@ def run(
         os.path.abspath(log_path),
         device,
         len(split["train_video_ids"]),
-        len(split["val_video_ids"]),
         os.path.abspath(split_manifest),
-        os.path.abspath(last_output),
     )
 
     model_started = time.perf_counter()
-    logger.info("model_prepare_start")
+    logger.info("model_prepare_start mode=realtime_last_node_distillation")
     (
         encoder,
         target_encoder,
@@ -841,31 +1168,32 @@ def run(
     _sync_for_timing(device)
     logger.info("model_prepare_done elapsed_s=%.3f", time.perf_counter() - model_started)
 
-    optimizer = torch.optim.AdamW(
-        optical_parameters(student_predictor),
-        lr=learning_rate,
-    )
+    trainable = list(optical_parameters(student_predictor))
+    if not trainable:
+        raise RuntimeError("no optical parameters are trainable")
+    optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     loader_started = time.perf_counter()
     train_loader = _make_loader(
         args_eval, split["train_video_ids"], deterministic=False
     )
-    val_loader = _make_loader(
-        args_eval, split["val_video_ids"], deterministic=True
-    )
     logger.info(
-        "data_loaders_ready elapsed_s=%.3f batch_size=%s train_batches=%d "
-        "val_batches=%d",
-        time.perf_counter() - loader_started,
+        "data_loader_ready mode=realtime_last_node_distillation "
+        "target_node=%s batch_size=%s train_batches=%d validation=disabled "
+        "clip_shape=[B,3,16,H,W] trainable_optical_params=%d elapsed_s=%.3f",
+        distill_cfg["target_node"],
         args_eval["data"].get("batch_size", 1),
         len(train_loader),
-        len(val_loader),
+        sum(parameter.numel() for parameter in trainable),
+        time.perf_counter() - loader_started,
     )
 
-    best_val_nmse = float("inf")
-    best_val_blocks = {}
-    best_epoch = 0
+    clip_grad = float(training_cfg.get("clip_grad", 10.0))
     global_step = 0
-    checkpoint = None
+    last_train_metrics = None
+    teacher_checkpoint = os.path.join(
+        args_eval["pretrain"]["folder"],
+        args_eval["pretrain"]["checkpoint"],
+    )
 
     for epoch in range(1, epochs + 1):
         train_metrics = _run_epoch(
@@ -882,121 +1210,87 @@ def run(
             epoch,
             training=True,
             max_steps=max_steps,
+            clip_grad=clip_grad,
         )
         global_step += train_metrics["batches"]
-        val_metrics = _run_epoch(
-            val_loader,
-            args_eval,
-            encoder,
-            target_encoder,
-            teacher_predictor,
-            student_predictor,
-            replace_layers,
-            optimizer,
-            device,
-            logger,
-            epoch,
-            training=False,
-            max_steps=max_steps,
-        )
-        improved = val_metrics["total_nmse"] < best_val_nmse
-        if improved:
-            best_val_nmse = val_metrics["total_nmse"]
-            best_val_blocks = dict(val_metrics["block_nmse"])
-            best_epoch = epoch
-            checkpoint = build_optical_checkpoint(
-                student_predictor,
-                optical_config=vars(optical_config),
-                replace_layers=replace_layers,
-                teacher_checkpoint=os.path.join(
-                    args_eval["pretrain"]["folder"],
-                    args_eval["pretrain"]["checkpoint"],
-                ),
-                distill_target=args_eval["optical_qkv"].get(
-                    "distill_target",
-                    "attention_proj_output_pre_residual",
-                ),
-                optimizer=optimizer,
-                step=global_step,
-                best_nmse={
-                    "total": best_val_nmse,
-                    "block_nmse": best_val_blocks,
-                },
-                epoch=epoch,
-                metadata={
-                    "best_epoch": best_epoch,
-                    "split_manifest": os.path.abspath(split_manifest),
-                    "train_video_ids": split["train_video_ids"],
-                    "val_video_ids": split["val_video_ids"],
-                },
-            )
-            save_started = time.perf_counter()
-            _save_checkpoint(checkpoint, output_path)
-            logger.info(
-                "best_checkpoint_saved epoch=%d best_val_total_nmse=%.6f "
-                "path=%s save_time_s=%.3f",
-                best_epoch,
-                best_val_nmse,
-                os.path.abspath(output_path),
-                time.perf_counter() - save_started,
-            )
+        last_train_metrics = train_metrics
         logger.info(
-            "epoch_done epoch=%d train_total_nmse=%.6f val_total_nmse=%.6f "
-            "best_val_total_nmse=%.6f improved=%s total_elapsed_s=%.3f",
+            "epoch_done mode=realtime_last_node_distillation target_node=%s "
+            "epoch=%d train_loss=%.6f train_nmse=%.6f train_cosine=%.6f "
+            "checkpoint=deferred_until_final elapsed_s=%.3f",
+            distill_cfg["target_node"],
             epoch,
-            train_metrics["total_nmse"],
-            val_metrics["total_nmse"],
-            best_val_nmse,
-            improved,
+            train_metrics["train_loss"],
+            train_metrics["train_nmse"],
+            train_metrics["train_cosine"],
             time.perf_counter() - run_started,
         )
 
-    if checkpoint is None:
-        raise RuntimeError("no best checkpoint was produced")
+    if last_train_metrics is None:
+        raise RuntimeError("no training checkpoint was produced")
 
-    last_checkpoint = build_optical_checkpoint(
+    final_checkpoint = build_optical_checkpoint(
         student_predictor,
         optical_config=vars(optical_config),
         replace_layers=replace_layers,
-        teacher_checkpoint=os.path.join(
-            args_eval["pretrain"]["folder"],
-            args_eval["pretrain"]["checkpoint"],
-        ),
-        distill_target=args_eval["optical_qkv"].get(
-            "distill_target",
-            "attention_proj_output_pre_residual",
-        ),
+        teacher_checkpoint=teacher_checkpoint,
+        distill_target=distill_cfg["target_node"],
         optimizer=optimizer,
         step=global_step,
         best_nmse={
-            "total": best_val_nmse,
-            "block_nmse": best_val_blocks,
+            "final_train_loss": last_train_metrics["train_loss"],
+            "final_train_nmse": last_train_metrics["train_nmse"],
+            "final_train_cosine": last_train_metrics["train_cosine"],
         },
         epoch=epochs,
+        target_node=distill_cfg["target_node"],
+        optimization_scope=distill_cfg["optimization_scope"],
+        cosine_loss_weight=distill_cfg["cosine_loss_weight"],
         metadata={
-            "checkpoint_kind": "last",
+            "checkpoint_kind": "final_last",
             "last_epoch": epochs,
-            "best_epoch": best_epoch,
+            "last_block": last_train_metrics["last_block"],
+            "validation_disabled": True,
             "split_manifest": os.path.abspath(split_manifest),
             "train_video_ids": split["train_video_ids"],
             "val_video_ids": split["val_video_ids"],
+            "heldout_test_video_ids": [],
+            "final_evaluation_dataset": "intphys-dev",
         },
     )
-    last_save_started = time.perf_counter()
-    _save_checkpoint(last_checkpoint, last_output)
+    save_started = time.perf_counter()
+    _save_checkpoint(final_checkpoint, output_path)
     logger.info(
-        "last_checkpoint_saved epoch=%d path=%s save_time_s=%.3f",
+        "final_checkpoint_saved mode=realtime_last_node_distillation "
+        "target_node=%s epoch=%d path=%s save_time_s=%.3f",
+        distill_cfg["target_node"],
         epochs,
-        os.path.abspath(last_output),
-        time.perf_counter() - last_save_started,
+        os.path.abspath(output_path),
+        time.perf_counter() - save_started,
     )
     logger.info(
-        "run_done best_epoch=%d best_val_total_nmse=%.6f total_elapsed_s=%.3f",
-        best_epoch,
-        best_val_nmse,
+        "run_done mode=realtime_last_node_distillation target_node=%s "
+        "final_epoch=%d final_train_loss=%.6f final=%s "
+        "validation=disabled final_evaluation_dataset=intphys-dev elapsed_s=%.3f",
+        distill_cfg["target_node"],
+        epochs,
+        last_train_metrics["train_loss"],
+        os.path.abspath(output_path),
         time.perf_counter() - run_started,
     )
-    return checkpoint
+    if (
+        not skip_final_eval
+        and bool(args_eval.get("evaluation", {}).get("run_after_training", True))
+    ):
+        _run_final_intphys_evaluation(
+            args_eval,
+            output_path,
+            Path(output_path).parent,
+            logger,
+            dev_only=True,
+        )
+    return final_checkpoint
+
 
 
 def run_end_to_end_jepa(
@@ -1011,7 +1305,12 @@ def run_end_to_end_jepa(
     final_output=None,
     resume_checkpoint=None,
     skip_final_eval=False,
+    experiment_mode="optical_qkv",
 ):
+    if experiment_mode not in {"optical_qkv", "electronic_control"}:
+        raise ValueError(
+            f"run_end_to_end_jepa does not support {experiment_mode}"
+        )
     if log_path is None:
         log_path = f"{output_path}.log"
     logger = _configure_logging(log_path)
@@ -1049,9 +1348,10 @@ def run_end_to_end_jepa(
         split_seed=int(split_cfg.get("split_seed", 42)),
     )
     logger.info(
-        "run_start mode=end_to_end_jepa epochs=%d max_steps=%s learning_rate=%g "
+        "run_start experiment_mode=%s epochs=%d max_steps=%s learning_rate=%g "
         "output=%s log=%s device=%s train_videos=%d val_videos=%d "
         "split_manifest=%s last_output=%s",
+        experiment_mode,
         epochs,
         max_steps,
         learning_rate,
@@ -1064,15 +1364,19 @@ def run_end_to_end_jepa(
         os.path.abspath(last_output),
     )
     model_started = time.perf_counter()
-    logger.info("model_prepare_start mode=end_to_end_jepa")
+    logger.info("model_prepare_start experiment_mode=%s", experiment_mode)
     encoder, target_encoder, predictor, optical_config, replace_layers = (
-        _prepare_end_to_end_models(args_eval, device)
+        _prepare_end_to_end_models(
+            args_eval, device, experiment_mode=experiment_mode
+        )
     )
     _sync_for_timing(device)
     logger.info("model_prepare_done elapsed_s=%.3f", time.perf_counter() - model_started)
     trainable = [parameter for parameter in predictor.parameters() if parameter.requires_grad]
     if len(trainable) != len(list(predictor.parameters())):
-        raise RuntimeError("end_to_end_jepa requires every Predictor parameter to be trainable")
+        raise RuntimeError(
+            f"{experiment_mode} requires every Predictor parameter to be trainable"
+        )
     optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     train_loader = _make_jepa_loader(
@@ -1088,8 +1392,9 @@ def run_end_to_end_jepa(
         collator=None,
     )
     logger.info(
-        "data_loaders_ready mode=end_to_end_jepa batch_size=%s train_batches=%d "
+        "data_loaders_ready experiment_mode=%s batch_size=%s train_batches=%d "
         "val_batches=%d clip_shape=[B,3,16,H,W]",
+        experiment_mode,
         args_eval["data"].get("batch_size", 1),
         len(train_loader),
         len(val_loader),
@@ -1101,7 +1406,12 @@ def run_end_to_end_jepa(
     if resume_checkpoint is not None:
         logger.info("resume_start checkpoint=%s", os.path.abspath(resume_checkpoint))
         resumed = _load_end_to_end_checkpoint(
-            resume_checkpoint, predictor, optimizer, scheduler
+            resume_checkpoint,
+            predictor,
+            optimizer,
+            scheduler,
+            expected_config=args_eval,
+            expected_mode=experiment_mode,
         )
         previous_split = resumed.get("data_split")
         if previous_split is not None and previous_split != split:
@@ -1112,6 +1422,45 @@ def run_end_to_end_jepa(
         start_epoch = int(resumed.get("epoch", 0)) + 1
     best_checkpoint = None
     clip_grad = float(training_cfg.get("clip_grad", 10.0))
+    if resume_checkpoint is None:
+        initial_val_metrics = _run_jepa_epoch(
+            val_loader,
+            args_eval,
+            encoder,
+            target_encoder,
+            predictor,
+            optimizer,
+            device,
+            logger,
+            0,
+            training=False,
+            max_steps=max_steps,
+            clip_grad=clip_grad,
+        )
+        best_val_loss = initial_val_metrics["jepa_loss"]
+        best_epoch = 0
+        best_checkpoint = _end_to_end_checkpoint(
+            predictor,
+            optimizer,
+            scheduler,
+            0,
+            global_step,
+            best_val_loss,
+            split,
+            split_manifest,
+            args_eval,
+            "best",
+            best_epoch=0,
+            experiment_mode=experiment_mode,
+        )
+        _save_checkpoint(best_checkpoint, output_path)
+        logger.info(
+            "best_checkpoint_saved experiment_mode=%s epoch=0 "
+            "val_jepa_loss=%.6f path=%s",
+            experiment_mode,
+            best_val_loss,
+            os.path.abspath(output_path),
+        )
     for epoch in range(start_epoch, epochs + 1):
         train_metrics = _run_jepa_epoch(
             train_loader,
@@ -1158,11 +1507,13 @@ def run_end_to_end_jepa(
                 split_manifest,
                 args_eval,
                 "best",
+                experiment_mode=experiment_mode,
             )
             _save_checkpoint(best_checkpoint, output_path)
             logger.info(
-                "best_checkpoint_saved mode=end_to_end_jepa epoch=%d "
+                "best_checkpoint_saved experiment_mode=%s epoch=%d "
                 "val_jepa_loss=%.6f path=%s",
+                experiment_mode,
                 epoch,
                 best_val_loss,
                 os.path.abspath(output_path),
@@ -1179,12 +1530,14 @@ def run_end_to_end_jepa(
             args_eval,
             "last",
             best_epoch=best_epoch,
+            experiment_mode=experiment_mode,
         )
         _save_checkpoint(last_checkpoint, last_output)
         logger.info(
-            "epoch_done mode=end_to_end_jepa epoch=%d train_jepa_loss=%.6f "
+            "epoch_done experiment_mode=%s epoch=%d train_jepa_loss=%.6f "
             "val_jepa_loss=%.6f best_val_jepa_loss=%.6f improved=%s "
-            "total_elapsed_s=%.3f",
+            "elapsed_s=%.3f",
+            experiment_mode,
             epoch,
             train_metrics["jepa_loss"],
             val_metrics["jepa_loss"],
@@ -1212,13 +1565,15 @@ def run_end_to_end_jepa(
             args_eval,
             "final",
             best_epoch=best_epoch,
+            experiment_mode=experiment_mode,
         ),
         final_output,
     )
     logger.info(
-        "run_done mode=end_to_end_jepa best_epoch=%d "
+        "run_done experiment_mode=%s best_epoch=%d "
         "best_val_jepa_loss=%.6f best=%s last=%s final=%s "
-        "total_elapsed_s=%.3f",
+        "elapsed_s=%.3f",
+        experiment_mode,
         best_epoch,
         best_val_loss,
         os.path.abspath(output_path),
@@ -1246,9 +1601,15 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=("end_to_end_jepa", "qkv_distill"),
+        choices=("end_to_end_jepa", "qkv_distill", "realtime_last_node_distillation"),
         default=None,
-        help="training mode; config training.mode is the fallback",
+        help="legacy mode alias; use --experiment-mode for the new switch",
+    )
+    parser.add_argument(
+        "--experiment-mode",
+        choices=("electronic_control", "optical_qkv", "realtime_last_node_distillation"),
+        default=None,
+        help="end-to-end experiment mode",
     )
     parser.add_argument(
         "--block",
@@ -1264,6 +1625,12 @@ def main():
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--target-node",
+        choices=("qkv", "attention_output", "post_output", "block_output", "predictor_output"),
+        default=None,
+        help="override distillation.target_node for realtime distillation",
+    )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--split-manifest", default=None)
     parser.add_argument("--last-output", default=None)
@@ -1273,14 +1640,24 @@ def main():
     config = _apply_cli_overrides(
         _load_config(args.config),
         batch_size=args.batch_size,
+        target_node=args.target_node,
     )
     outputs = _resolve_run_outputs(args.output)
-    mode = args.mode or config.get("training", {}).get(
-        "mode", "end_to_end_jepa"
-    )
-    if mode == "qkv_distill":
+    training_cfg = config.setdefault("training", {})
+    if args.mode is not None:
+        training_cfg["experiment_mode"] = {
+            "end_to_end_jepa": "optical_qkv",
+            "qkv_distill": "realtime_last_node_distillation",
+            "realtime_last_node_distillation": "realtime_last_node_distillation",
+        }[args.mode]
+    if args.experiment_mode is not None:
+        training_cfg["experiment_mode"] = args.experiment_mode
+    mode = _resolve_experiment_mode(config)
+    if mode == "realtime_last_node_distillation":
         if args.resume is not None:
-            raise ValueError("qkv_distill does not use --resume")
+            raise ValueError(
+                "realtime_last_node_distillation does not use --resume"
+            )
         run(
             config,
             output_path=outputs["output"],
@@ -1297,8 +1674,9 @@ def main():
             last_output=_path_in_run_dir(
                 outputs["run_dir"], args.last_output, outputs["last_output"]
             ),
+            skip_final_eval=args.skip_final_eval,
         )
-    elif mode == "end_to_end_jepa":
+    elif mode in {"optical_qkv", "electronic_control"}:
         run_end_to_end_jepa(
             config,
             output_path=outputs["output"],
@@ -1317,6 +1695,7 @@ def main():
             final_output=outputs["final_output"],
             resume_checkpoint=args.resume,
             skip_final_eval=args.skip_final_eval,
+            experiment_mode=mode,
         )
     else:
         raise ValueError(f"unsupported training mode: {mode}")

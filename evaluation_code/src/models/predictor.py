@@ -239,6 +239,85 @@ class VisionTransformerPredictor(nn.Module):
             x = block(x, False, masks)
         return attention_inputs, masks
 
+    def forward_with_nodes(
+        self,
+        ctxt,
+        tgt,
+        masks_ctxt,
+        masks_tgt,
+        target_node,
+        mask_index=1,
+        qkv_include_bias=True,
+    ):
+        """Run the serial Predictor path and return one selected node per Block."""
+        valid_nodes = {
+            "qkv",
+            "attention_output",
+            "post_output",
+            "block_output",
+            "predictor_output",
+        }
+        if target_node not in valid_nodes:
+            raise ValueError(f"unsupported target_node: {target_node}")
+        assert (masks_ctxt is not None) and (masks_tgt is not None), (
+            "Cannot run predictor without mask indices"
+        )
+        if not isinstance(masks_ctxt, list):
+            masks_ctxt = [masks_ctxt]
+        if not isinstance(masks_tgt, list):
+            masks_tgt = [masks_tgt]
+
+        B = len(ctxt) // len(masks_ctxt)
+        x = self.predictor_embed(ctxt)
+        _, N_ctxt, _ = x.shape
+
+        if self.predictor_pos_embed is not None:
+            ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
+            x += apply_masks(ctxt_pos_embed, masks_ctxt)
+
+        if self.mask_tokens is None:
+            pred_tokens = self.predictor_embed(tgt)
+            pred_tokens = self.diffusion(pred_tokens)
+        else:
+            mask_index = mask_index % self.num_mask_tokens
+            pred_tokens = self.mask_tokens[mask_index]
+            pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
+            pred_tokens = apply_masks(pred_tokens, masks_tgt)
+
+        if self.predictor_pos_embed is not None:
+            pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
+            pos_embs = apply_masks(pos_embs, masks_tgt)
+            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_ctxt))
+            pred_tokens += pos_embs
+
+        x = x.repeat(len(masks_tgt), 1, 1)
+        x = torch.cat([x, pred_tokens], dim=1)
+        masks_ctxt = torch.cat(masks_ctxt, dim=0)
+        masks_tgt = torch.cat(masks_tgt, dim=0)
+        masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
+
+        nodes = {} if target_node == "predictor_output" else {target_node: []}
+        for blk in self.predictor_blocks:
+            if target_node == "predictor_output":
+                x = blk(x, False, masks)
+            else:
+                x, captured = blk(
+                    x,
+                    False,
+                    masks,
+                    capture_nodes={target_node},
+                    qkv_include_bias=qkv_include_bias,
+                )
+                nodes[target_node].append(captured[target_node])
+
+        x = self.predictor_norm(x)
+        x = x[:, N_ctxt:]
+        x = self.predictor_proj(x)
+        if target_node == "predictor_output":
+            nodes[target_node] = x
+        return x, nodes
+
+
     def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1, num_blocks=None):
         """
         :param ctxt: context tokens
