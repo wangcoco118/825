@@ -22,6 +22,7 @@ from evals.intuitive_physics.train_optical import (
     _last_checkpoint_path,
     _load_end_to_end_checkpoint,
     _save_checkpoint,
+    _require_existing_video_split,
 )
 from evals.intuitive_physics.optical_split import (
     build_video_split,
@@ -31,6 +32,23 @@ from src.models.predictor import VisionTransformerPredictor
 from src.models.utils.modules import Block
 from src.models.optical_distillation import freeze_stage_one
 from src.utils.transforms import VideoTransform
+
+
+class ExistingSplitTests(unittest.TestCase):
+    def test_missing_manifest_is_rejected_without_auto_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory) / "train"
+            data_root.mkdir()
+            manifest = Path(directory) / "missing.json"
+
+            with self.assertRaisesRegex(FileNotFoundError, "split manifest"):
+                _require_existing_video_split(
+                    data_root,
+                    manifest,
+                    num_train_videos=1,
+                    num_val_videos=1,
+                    split_seed=42,
+                )
 
 
 class OpticalSplitTests(unittest.TestCase):

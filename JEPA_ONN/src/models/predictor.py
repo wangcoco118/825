@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from src.masks.utils import apply_masks
 from src.models.utils.modules import Block
-from src.models.fsonn import OpticalQKVConfig, TimeDivisionFSONN
+from src.models.fsonn import FeedbackFSONN, ONNConfig, OpticalQKVConfig, TimeDivisionFSONN
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
@@ -431,12 +431,14 @@ class ONNFeedbackPredictor(nn.Module):
         self.mask_token = nn.Parameter(
             torch.zeros(1, 1, self.predictor_embed_dim)
         )
-        self.predictor_pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_tokens, self.predictor_embed_dim),
-            requires_grad=False,
+        predictor_pos_embed = torch.zeros(
+            1, self.num_tokens, self.predictor_embed_dim
+        )
+        self.register_buffer(
+            "predictor_pos_embed", predictor_pos_embed, persistent=True
         )
         self._init_pos_embed(
-            self.predictor_pos_embed.data,
+            self.predictor_pos_embed,
             img_size=img_size,
             patch_size=patch_size,
             num_frames=num_frames,
@@ -454,21 +456,20 @@ class ONNFeedbackPredictor(nn.Module):
             config_values = dict(optical_config or {})
             config_values.update(
                 {
-                    "num_time_slots": 1,
-                    "token_chunk_size": self.chunk_tokens,
+                    "chunk_tokens": self.chunk_tokens,
                     "input_dim": self.predictor_embed_dim,
-                    "qkv_output_dim": self.predictor_embed_dim,
+                    "output_dim": self.predictor_embed_dim,
                     "grid_height": self.chunk_tokens,
                     "grid_width": self.predictor_embed_dim,
                     "learnable_intensity_offset": True,
                 }
             )
-            onn_config = OpticalQKVConfig.from_mapping(config_values)
-            onn_core = TimeDivisionFSONN(onn_config)
+            onn_config = ONNConfig.from_mapping(config_values)
+            onn_core = FeedbackFSONN(onn_config)
         self.onn_core = onn_core
 
         if feedback_layer_index is None:
-            feedback_layer_index = len(getattr(self.onn_core, "slm_layers", ())) // 2
+            feedback_layer_index = 2
         self.feedback_layer_index = int(feedback_layer_index)
         slm_layers = getattr(self.onn_core, "slm_layers", ())
         if slm_layers and not 0 <= self.feedback_layer_index < len(slm_layers):

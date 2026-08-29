@@ -28,10 +28,15 @@ from src.models.optical_distillation import (
 )
 from evals.intuitive_physics.data_manager import init_data
 from evals.intuitive_physics.eval import init_model
-from evals.intuitive_physics.optical_split import load_or_create_video_split
+from evals.intuitive_physics.optical_split import (
+    load_or_create_video_split,
+    require_existing_video_split,
+)
 from evals.intuitive_physics.utils import get_dataset_paths, get_time_masks
 from src.utils.transforms import make_transforms
 
+
+_require_existing_video_split = require_existing_video_split
 
 def _configure_logging(log_path):
     log_path = os.path.abspath(log_path)
@@ -149,6 +154,7 @@ def _resolve_experiment_mode(args_eval):
         "electronic_control",
         "optical_qkv",
         "realtime_last_node_distillation",
+        "onn_feedback",
     }:
         raise ValueError(f"unsupported experiment mode: {mode}")
     if (
@@ -801,7 +807,9 @@ def _prepare_jepa_batch(batch, args_eval, encoder, target_encoder, device):
 def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv"):
     predictor_type = args_eval.setdefault("predictor_type", "onn_feedback")
     optical_cfg = args_eval.get("optical_qkv", {})
-    onn_cfg = args_eval.get("onn_feedback", optical_cfg)
+    onn_cfg = args_eval.get(
+        "onn", args_eval.get("onn_feedback", optical_cfg)
+    )
 
     if predictor_type == "onn_feedback":
         optical_config = copy.deepcopy(onn_cfg)
@@ -862,6 +870,23 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
     predictor.train()
     for parameter in predictor.parameters():
         parameter.requires_grad_(True)
+    if predictor_type == "onn_feedback":
+        assert all(not p.requires_grad for p in encoder.parameters())
+        assert all(not p.requires_grad for p in target_encoder.parameters())
+        predictor_parameters = dict(predictor.named_parameters())
+        predictor_buffers = dict(predictor.named_buffers())
+        pos_names = [
+            name for name in predictor_buffers
+            if name.endswith("predictor_pos_embed")
+        ]
+        assert pos_names
+        assert all(
+            "predictor_pos_embed" not in name
+            for name in predictor_parameters
+        )
+        assert all(
+            not predictor_buffers[name].requires_grad for name in pos_names
+        )
     return encoder, target_encoder, predictor, optical_config, replace_layers
 
 
@@ -998,11 +1023,13 @@ def _end_to_end_checkpoint(
         key: value.detach().cpu().clone()
         for key, value in predictor.state_dict().items()
     }
-    checkpoint_mode = (
-        "end_to_end_jepa"
-        if experiment_mode == "optical_qkv"
-        else "electronic_control"
-    )
+    checkpoint_mode = {
+        "optical_qkv": "end_to_end_jepa",
+        "electronic_control": "electronic_control",
+        "onn_feedback": "onn_feedback",
+    }.get(experiment_mode)
+    if checkpoint_mode is None:
+        raise ValueError(f"unsupported checkpoint experiment mode: {experiment_mode}")
     return {
         "format_version": 1,
         "mode": checkpoint_mode,
@@ -1021,6 +1048,18 @@ def _end_to_end_checkpoint(
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
         "predictor_type": args_eval.get("predictor_type", "onn_feedback"),
+        "num_tokens": 1568,
+        "num_chunks": 8,
+        "chunk_tokens": 196,
+        "predictor_dim": 384,
+        "output_dim": 1024,
+        "feedback_mode": "fixed_middle",
+        "feedback_layer_index": 2,
+        "readout_mode": "intensity_minus_learnable_offset",
+        "differential_detector": False,
+        "onn": copy.deepcopy(
+            args_eval.get("onn", args_eval.get("onn_feedback", {}))
+        ),
         "onn_feedback": copy.deepcopy(args_eval.get("onn_feedback", {})),
         "optical_qkv": (
             copy.deepcopy(args_eval.get("optical_qkv", {}))
@@ -1351,7 +1390,7 @@ def run_end_to_end_jepa(
     skip_final_eval=False,
     experiment_mode="optical_qkv",
 ):
-    if experiment_mode not in {"optical_qkv", "electronic_control"}:
+    if experiment_mode not in {"optical_qkv", "electronic_control", "onn_feedback"}:
         raise ValueError(
             f"run_end_to_end_jepa does not support {experiment_mode}"
         )
@@ -1384,7 +1423,7 @@ def run_end_to_end_jepa(
             f"{Path(output_path).stem}.final{Path(output_path).suffix or '.pt'}"
         )
     train_root = get_dataset_paths(["IntPhys-train"])[0]
-    split = load_or_create_video_split(
+    split = require_existing_video_split(
         train_root,
         split_manifest,
         num_train_videos=int(split_cfg.get("num_train_videos", 1500)),
@@ -1655,7 +1694,7 @@ def main():
     )
     parser.add_argument(
         "--experiment-mode",
-        choices=("electronic_control", "optical_qkv", "realtime_last_node_distillation"),
+        choices=("onn_feedback", "electronic_control", "optical_qkv", "realtime_last_node_distillation"),
         default=None,
         help="end-to-end experiment mode",
     )
@@ -1724,7 +1763,7 @@ def main():
             ),
             skip_final_eval=args.skip_final_eval,
         )
-    elif mode in {"optical_qkv", "electronic_control"}:
+    elif mode in {"onn_feedback", "optical_qkv", "electronic_control"}:
         run_end_to_end_jepa(
             config,
             output_path=outputs["output"],

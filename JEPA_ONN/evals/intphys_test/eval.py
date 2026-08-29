@@ -171,7 +171,9 @@ def main(args_eval, resume_preempt=False):
         optical_qkv=optical_qkv,
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
-        onn_feedback_config=args_eval.get("onn_feedback", optical_qkv),
+        onn_feedback_config=args_eval.get(
+            "onn", args_eval.get("onn_feedback", optical_qkv)
+        ),
     )
     
     if not is_mae:

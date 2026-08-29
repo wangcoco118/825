@@ -63,6 +63,29 @@ def _validate_manifest(manifest: dict, available_video_ids: set[str]) -> dict:
     return manifest
 
 
+def require_existing_video_split(
+    data_root,
+    manifest_path,
+    num_train_videos: int,
+    num_val_videos: int,
+    split_seed: int,
+) -> dict:
+    """Load a persisted split and reject missing manifests."""
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"split manifest does not exist; refusing to create a random split: "
+            f"{manifest_path}"
+        )
+    return load_or_create_video_split(
+        data_root,
+        manifest_path,
+        num_train_videos=num_train_videos,
+        num_val_videos=num_val_videos,
+        split_seed=split_seed,
+    )
+
+
 def load_or_create_video_split(
     data_root,
     manifest_path,
