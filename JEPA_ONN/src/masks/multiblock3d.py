@@ -17,6 +17,61 @@ _GLOBAL_SEED = 0
 logger = getLogger()
 
 
+MASK_MODES = ("unified_random", "classic_random")
+
+
+def normalize_mask_mode(mask_mode):
+    mode = "classic_random" if mask_mode is None else str(mask_mode).strip().lower()
+    if mode not in MASK_MODES:
+        raise ValueError(
+            f"mask_mode must be one of {MASK_MODES}, got {mask_mode!r}"
+        )
+    return mode
+
+
+def default_mask_config():
+    return [
+        {
+            "aspect_ratio": [0.75, 1.5],
+            "num_blocks": 8,
+            "spatial_scale": [0.15, 0.15],
+            "temporal_scale": [1.0, 1.0],
+            "max_temporal_keep": 1.0,
+            "max_keep": None,
+        },
+        {
+            "aspect_ratio": [0.75, 1.5],
+            "num_blocks": 2,
+            "spatial_scale": [0.7, 0.7],
+            "temporal_scale": [1.0, 1.0],
+            "max_temporal_keep": 1.0,
+            "max_keep": None,
+        },
+    ]
+
+
+def make_mask_collator(
+    mask_mode,
+    cfgs_mask=None,
+    crop_size=(224, 224),
+    num_frames=16,
+    patch_size=(16, 16),
+    tubelet_size=2,
+):
+    collator_type = (
+        UnifiedMaskCollator
+        if normalize_mask_mode(mask_mode) == "unified_random"
+        else MaskCollator
+    )
+    return collator_type(
+        cfgs_mask=cfgs_mask or default_mask_config(),
+        crop_size=crop_size,
+        num_frames=num_frames,
+        patch_size=patch_size,
+        tubelet_size=tubelet_size,
+    )
+
+
 class MaskCollator(object):
 
     def __init__(
@@ -49,18 +104,33 @@ class MaskCollator(object):
         for mask_generator in self.mask_generators:
             mask_generator.step()
 
-    def __call__(self, batch):
-
-        batch_size = len(batch)
-        collated_batch = torch.utils.data.default_collate(batch)
-
+    def generate_masks(self, batch_size):
+        batch_size = int(batch_size)
         collated_masks_pred, collated_masks_enc = [], []
-        for i, mask_generator in enumerate(self.mask_generators):
+        for mask_generator in self.mask_generators:
             masks_enc, masks_pred = mask_generator(batch_size)
             collated_masks_enc.append(masks_enc)
             collated_masks_pred.append(masks_pred)
+        return collated_masks_enc, collated_masks_pred
 
+    def __call__(self, batch):
+        batch_size = len(batch)
+        collated_batch = torch.utils.data.default_collate(batch)
+        collated_masks_enc, collated_masks_pred = self.generate_masks(batch_size)
         return collated_batch, collated_masks_enc, collated_masks_pred
+
+
+class UnifiedMaskCollator(MaskCollator):
+    def generate_masks(self, batch_size):
+        batch_size = int(batch_size)
+        collated_masks_enc, collated_masks_pred = [], []
+        for mask_generator in self.mask_generators:
+            masks_enc, masks_pred = mask_generator(1)
+            common_enc = masks_enc[0].unsqueeze(0).repeat(batch_size, 1)
+            common_pred = masks_pred[0].unsqueeze(0).repeat(batch_size, 1)
+            collated_masks_enc.append(common_enc)
+            collated_masks_pred.append(common_pred)
+        return collated_masks_enc, collated_masks_pred
 
 
 class _MaskGenerator(object):

@@ -1,5 +1,6 @@
 # V-JEPA IntPhys ONN feedback Predictor configuration.
 predictor_type: onn_feedback
+mask_mode: unified_random
 
 pretrain:
   enc_checkpoint_key: encoder

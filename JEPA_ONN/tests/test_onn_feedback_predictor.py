@@ -90,6 +90,7 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
         output = predictor(context, None, masks_ctxt, masks_tgt)
 
         self.assertEqual(tuple(output.shape), (1, 1000, 1024))
+        self.assertEqual(predictor.last_trace["covered_count"], 1008)
         self.assertEqual(predictor.last_trace["missing_count"], 560)
 
     def test_mask_token_mode_does_not_read_real_target(self):

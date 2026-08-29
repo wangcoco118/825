@@ -38,18 +38,23 @@ class TrainLoggingTests(unittest.TestCase):
             stage="val",
             step=1,
             total_steps=4,
+            mask_mode="unified_random",
             batch_size=20,
+            n_ctxt=196,
+            n_tgt=1372,
+            covered_count=1568,
+            missing_count=0,
             loss=0.713809,
             grad_norm=0.0,
-            missing_count=0,
             time_s=1.561,
         )
 
         self.assertEqual(
             message,
-            "epoch=0 stage=val [#####---------------] 25.0% (1/4) "
-            "batch=20 loss=0.713809 grad_norm=0.000 "
-            "missing_count=0 time=1.561s",
+            "epoch=0 stage=val mask_mode=unified_random "
+            "[#####---------------] 25.0% (1/4) batch=20 "
+            "n_ctxt=196 n_tgt=1372 covered_count=1568 "
+            "missing_count=0 loss=0.713809 grad_norm=0.000 time=1.561s",
         )
         for repeated_field in (
             "ctxt_shape",

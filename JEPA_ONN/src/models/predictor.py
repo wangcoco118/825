@@ -515,6 +515,7 @@ class ONNFeedbackPredictor(nn.Module):
         if torch.any(masks_tgt < 0) or torch.any(masks_tgt >= self.num_tokens):
             raise ValueError("masks_tgt indices must be in [0,1567]")
 
+        covered_counts = []
         missing_counts = []
         for batch_index in range(batch_size):
             merged = torch.cat(
@@ -523,8 +524,9 @@ class ONNFeedbackPredictor(nn.Module):
             unique_count = torch.unique(merged).numel()
             if unique_count != merged.numel():
                 raise ValueError("masks_ctxt and masks_tgt overlap or duplicate a token")
+            covered_counts.append(unique_count)
             missing_counts.append(self.num_tokens - unique_count)
-        return missing_counts
+        return covered_counts, missing_counts
 
     def forward(
         self,
@@ -542,7 +544,7 @@ class ONNFeedbackPredictor(nn.Module):
             )
         if masks_ctxt is None or masks_tgt is None:
             raise ValueError("ONN feedback Predictor requires both mask indices")
-        missing_counts = self._validate_masks(
+        covered_counts, missing_counts = self._validate_masks(
             masks_ctxt, masks_tgt, ctxt.shape[0]
         )
 
@@ -620,6 +622,11 @@ class ONNFeedbackPredictor(nn.Module):
             "pred_tgt_1024_shape": tuple(pred_tgt_1024.shape),
             "n_ctxt": int(masks_ctxt.shape[1]),
             "n_tgt": int(masks_tgt.shape[1]),
+            "covered_count": (
+                covered_counts[0]
+                if len(set(covered_counts)) <= 1
+                else covered_counts
+            ),
             "missing_count": (
                 missing_counts[0]
                 if len(set(missing_counts)) <= 1

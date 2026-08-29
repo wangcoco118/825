@@ -22,7 +22,12 @@ import yaml
 
 from src.models import predictor as vit_pred
 from src.masks.utils import apply_masks
-from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
+from src.masks.multiblock3d import (
+    MaskCollator as MB3DMaskCollator,
+    UnifiedMaskCollator,
+    make_mask_collator,
+    normalize_mask_mode,
+)
 from src.models.fsonn import OpticalQKVConfig
 from src.models.optical_distillation import (
     build_optical_checkpoint,
@@ -148,20 +153,25 @@ def _format_progress(step, total_steps, width=20):
 def _format_jepa_batch_log(
     epoch,
     stage,
+    mask_mode,
     step,
     total_steps,
     batch_size,
+    n_ctxt,
+    n_tgt,
+    covered_count,
+    missing_count,
     loss,
     grad_norm,
-    missing_count,
     time_s,
 ):
     return (
-        f"epoch={int(epoch)} stage={stage} "
+        f"epoch={int(epoch)} stage={stage} mask_mode={mask_mode} "
         f"{_format_progress(step, total_steps)} "
-        f"batch={int(batch_size)} loss={float(loss):.6f} "
-        f"grad_norm={float(grad_norm):.3f} "
-        f"missing_count={missing_count} time={float(time_s):.3f}s"
+        f"batch={int(batch_size)} n_ctxt={n_ctxt} n_tgt={n_tgt} "
+        f"covered_count={covered_count} missing_count={missing_count} "
+        f"loss={float(loss):.6f} grad_norm={float(grad_norm):.3f} "
+        f"time={float(time_s):.3f}s"
     )
 
 
@@ -219,14 +229,22 @@ def _load_config(path):
         return yaml.safe_load(handle)
 
 
-def _apply_cli_overrides(config, batch_size=None, target_node=None):
+def _apply_cli_overrides(config, batch_size=None, target_node=None, mask_mode=None):
     if batch_size is not None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         config.setdefault("data", {})["batch_size"] = int(batch_size)
     if target_node is not None:
         config.setdefault("distillation", {})["target_node"] = target_node
+    if mask_mode is not None:
+        config["mask_mode"] = normalize_mask_mode(mask_mode)
     return config
+
+
+def _resolve_mask_mode(args_eval):
+    training_cfg = args_eval.get("training", {})
+    configured = args_eval.get("mask_mode", training_cfg.get("mask_mode"))
+    return normalize_mask_mode(configured)
 
 
 def _resolve_experiment_mode(args_eval):
@@ -780,7 +798,8 @@ def _default_jepa_mask_config():
 def _make_jepa_mask_collator(args_eval):
     data_cfg = args_eval["data"]
     pretrain_cfg = args_eval["pretrain"]
-    return MB3DMaskCollator(
+    return make_mask_collator(
+        mask_mode=_resolve_mask_mode(args_eval),
         cfgs_mask=args_eval.get("mask") or _default_jepa_mask_config(),
         crop_size=(
             int(data_cfg.get("resolution", 224)),
@@ -1055,22 +1074,21 @@ def _run_jepa_epoch(
             else predictor_core
         )
         trace = getattr(predictor_core, "last_trace", {})
-        context_shape = (
-            tuple(context[0].shape)
-            if isinstance(context, (list, tuple))
-            else tuple(context.shape)
-        )
         if int(rank) == 0:
             logger.info(
                 _format_jepa_batch_log(
                     epoch=epoch,
                     stage=stage,
+                    mask_mode=_resolve_mask_mode(args_eval),
                     step=batches,
                     total_steps=stage_total,
                     batch_size=clips.shape[0],
+                    n_ctxt=trace.get("n_ctxt"),
+                    n_tgt=trace.get("n_tgt"),
+                    covered_count=trace.get("covered_count"),
+                    missing_count=trace.get("missing_count"),
                     loss=loss_value,
                     grad_norm=grad_norm,
-                    missing_count=trace.get("missing_count"),
                     time_s=time.perf_counter() - step_started,
                 )
             )
@@ -1150,6 +1168,7 @@ def _end_to_end_checkpoint(
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
         "predictor_type": args_eval.get("predictor_type", "onn_feedback"),
+        "mask_mode": _resolve_mask_mode(args_eval),
         "num_tokens": 1568,
         "num_chunks": 8,
         "chunk_tokens": 196,
@@ -1549,10 +1568,11 @@ def run_end_to_end_jepa(
         split_seed=int(split_cfg.get("split_seed", 42)),
     )
     logger.info(
-        "run_start experiment_mode=%s epochs=%d max_steps=%s learning_rate=%g "
+        "run_start experiment_mode=%s mask_mode=%s epochs=%d max_steps=%s learning_rate=%g "
         "output=%s log=%s device=%s train_videos=%d val_videos=%d "
         "split_manifest=%s last_output=%s",
         experiment_mode,
+        _resolve_mask_mode(args_eval),
         epochs,
         max_steps,
         learning_rate,
@@ -1621,7 +1641,7 @@ def run_end_to_end_jepa(
         args_eval,
         split["val_video_ids"],
         deterministic=True,
-        collator=None,
+        collator=_make_jepa_mask_collator(args_eval),
         world_size=world_size,
         rank=rank,
     )
@@ -1967,6 +1987,12 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
+        "--mask-mode",
+        choices=("unified_random", "classic_random"),
+        default=None,
+        help="override the configured mask generation mode",
+    )
+    parser.add_argument(
         "--target-node",
         choices=("qkv", "attention_output", "post_output", "block_output", "predictor_output"),
         default=None,
@@ -1988,6 +2014,7 @@ def main():
         _load_config(args.config),
         batch_size=args.batch_size,
         target_node=args.target_node,
+        mask_mode=args.mask_mode,
     )
     outputs = _resolve_run_outputs(args.output)
     training_cfg = config.setdefault("training", {})
