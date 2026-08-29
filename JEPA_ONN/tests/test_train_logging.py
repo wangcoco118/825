@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from evals.intuitive_physics.train_optical import _configure_logging, _format_progress
+from evals.intuitive_physics.train_optical import (
+    _configure_logging,
+    _format_jepa_batch_log,
+    _format_progress,
+)
 
 
 class TrainLoggingTests(unittest.TestCase):
@@ -23,7 +27,40 @@ class TrainLoggingTests(unittest.TestCase):
 
 
     def test_progress_format_uses_completed_step_and_stage_total(self):
-        self.assertEqual(_format_progress(10, 40), "step=10/40 progress=25.0%")
+        self.assertEqual(
+            _format_progress(10, 40),
+            "[#####---------------] 25.0% (10/40)",
+        )
+
+    def test_batch_log_contains_only_dynamic_training_fields(self):
+        message = _format_jepa_batch_log(
+            epoch=0,
+            stage="val",
+            step=1,
+            total_steps=4,
+            batch_size=20,
+            loss=0.713809,
+            grad_norm=0.0,
+            missing_count=0,
+            time_s=1.561,
+        )
+
+        self.assertEqual(
+            message,
+            "epoch=0 stage=val [#####---------------] 25.0% (1/4) "
+            "batch=20 loss=0.713809 grad_norm=0.000 "
+            "missing_count=0 time=1.561s",
+        )
+        for repeated_field in (
+            "ctxt_shape",
+            "onn_shape",
+            "chunk=",
+            "feedback_layer",
+            "lr=",
+            "batch_time_s",
+            "epoch_time_s",
+        ):
+            self.assertNotIn(repeated_field, message)
 
 
 if __name__ == "__main__":

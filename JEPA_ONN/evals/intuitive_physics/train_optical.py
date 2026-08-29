@@ -14,7 +14,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 import yaml
 
 from src.models import predictor as vit_pred
@@ -38,19 +41,82 @@ from src.utils.transforms import make_transforms
 
 _require_existing_video_split = require_existing_video_split
 
-def _configure_logging(log_path):
+
+def _resolve_gpu_ids(gpu=None, gpus=None):
+    """Normalize single- and multi-GPU CLI selections."""
+    if gpu is not None and gpus is not None:
+        raise ValueError("--gpu and --gpus are mutually exclusive")
+    values = [gpu] if gpu is not None else (list(gpus) if gpus else [0])
+    ids = [int(value) for value in values]
+    if any(value < 0 for value in ids):
+        raise ValueError("GPU ids must be non-negative")
+    if len(set(ids)) != len(ids):
+        raise ValueError("GPU ids must not contain duplicates")
+    return ids
+
+
+def _device_for_gpu(gpu_id, world_size=1):
+    if not torch.cuda.is_available():
+        if world_size > 1:
+            raise RuntimeError("multi-GPU training requires CUDA")
+        return torch.device("cpu")
+    gpu_id = int(gpu_id)
+    count = torch.cuda.device_count()
+    if gpu_id >= count:
+        raise ValueError(
+            f"GPU id {gpu_id} is unavailable; visible GPU count is {count}"
+        )
+    torch.cuda.set_device(gpu_id)
+    return torch.device(f"cuda:{gpu_id}")
+
+
+def _unwrap_module(module):
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def _distributed_worker(rank, config, args, outputs, gpu_ids):
+    world_size = len(gpu_ids)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(args.dist_port)
+    device = _device_for_gpu(gpu_ids[rank], world_size=world_size)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        _run_selected_mode(
+            config,
+            args,
+            outputs,
+            rank=rank,
+            world_size=world_size,
+            gpu_ids=gpu_ids,
+            device=device,
+        )
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+def _configure_logging(log_path, rank=0):
     log_path = os.path.abspath(log_path)
     parent = os.path.dirname(log_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    logger = logging.getLogger("fsonn.train")
-    logger.setLevel(logging.INFO)
+    logger = logging.getLogger(
+        "fsonn.train" if int(rank) == 0 else f"fsonn.train.rank{int(rank)}"
+    )
+    logger.setLevel(logging.INFO if int(rank) == 0 else logging.ERROR)
     logger.propagate = False
     for handler in list(logger.handlers):
         handler.flush()
         handler.close()
         logger.removeHandler(handler)
+
+    if int(rank) != 0:
+        logger.addHandler(logging.NullHandler())
+        return logger
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
@@ -70,10 +136,33 @@ def _sync_for_timing(device):
         torch.cuda.synchronize(device)
 
 
-def _format_progress(step, total_steps):
+def _format_progress(step, total_steps, width=20):
     total_steps = max(int(total_steps), 1)
     step = min(max(int(step), 0), total_steps)
-    return f"step={step}/{total_steps} progress={step / total_steps * 100.0:.1f}%"
+    ratio = step / total_steps
+    filled = int(round(ratio * int(width)))
+    bar = "#" * filled + "-" * (int(width) - filled)
+    return f"[{bar}] {ratio * 100.0:.1f}% ({step}/{total_steps})"
+
+
+def _format_jepa_batch_log(
+    epoch,
+    stage,
+    step,
+    total_steps,
+    batch_size,
+    loss,
+    grad_norm,
+    missing_count,
+    time_s,
+):
+    return (
+        f"epoch={int(epoch)} stage={stage} "
+        f"{_format_progress(step, total_steps)} "
+        f"batch={int(batch_size)} loss={float(loss):.6f} "
+        f"grad_norm={float(grad_norm):.3f} "
+        f"missing_count={missing_count} time={float(time_s):.3f}s"
+    )
 
 
 def _last_checkpoint_path(output_path):
@@ -711,6 +800,8 @@ def _make_jepa_loader(
     video_ids,
     deterministic=False,
     collator=None,
+    world_size=1,
+    rank=0,
 ):
     data_cfg = args_eval["data"]
     frames_per_clip = int(data_cfg.get("frames_per_clip", 16))
@@ -732,8 +823,8 @@ def _make_jepa_loader(
         collator=collator,
         pin_mem=True,
         num_workers=0,
-        world_size=1,
-        rank=0,
+        world_size=world_size,
+        rank=rank,
         root_path=get_dataset_paths(["IntPhys-train"])[0],
         clip_len=frames_per_clip,
         frame_sample_rate=_get_training_sampling_rate(args_eval),
@@ -903,8 +994,13 @@ def _run_jepa_epoch(
     training,
     max_steps=None,
     clip_grad=10.0,
+    rank=0,
+    world_size=1,
 ):
     stage = "train" if training else "val"
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(int(epoch))
     predictor.train(training)
     encoder.eval()
     target_encoder.eval()
@@ -952,10 +1048,11 @@ def _run_jepa_epoch(
         loss_value = float(loss.detach())
         total_loss += loss_value
         batches += 1
+        predictor_core = _unwrap_module(predictor)
         predictor_core = (
-            predictor.backbone
-            if hasattr(predictor, "backbone")
-            else predictor
+            predictor_core.backbone
+            if hasattr(predictor_core, "backbone")
+            else predictor_core
         )
         trace = getattr(predictor_core, "last_trace", {})
         context_shape = (
@@ -963,29 +1060,29 @@ def _run_jepa_epoch(
             if isinstance(context, (list, tuple))
             else tuple(context.shape)
         )
-        logger.info(
-            "epoch=%d stage=%s %s batch_size=%d ctxt_shape=%s "
-            "n_ctxt=%s n_tgt=%s onn_shape=%s chunk=%s/%s "
-            "pred_shape=%s feedback_layer=%s jepa_loss=%.6f "
-            "lr=%.6g batch_time_s=%.3f epoch_time_s=%.3f grad_norm=%.3f",
-            epoch,
-            stage,
-            _format_progress(batches, stage_total),
-            clips.shape[0],
-            context_shape,
-            trace.get("n_ctxt"),
-            trace.get("n_tgt"),
-            trace.get("onn_input_shape"),
-            trace.get("current_chunk"),
-            trace.get("num_chunks"),
-            trace.get("pred_tgt_1024_shape"),
-            trace.get("feedback_layer_index"),
-            loss_value,
-            optimizer.param_groups[0]["lr"],
-            time.perf_counter() - step_started,
-            time.perf_counter() - started,
-            float(grad_norm),
+        if int(rank) == 0:
+            logger.info(
+                _format_jepa_batch_log(
+                    epoch=epoch,
+                    stage=stage,
+                    step=batches,
+                    total_steps=stage_total,
+                    batch_size=clips.shape[0],
+                    loss=loss_value,
+                    grad_norm=grad_norm,
+                    missing_count=trace.get("missing_count"),
+                    time_s=time.perf_counter() - step_started,
+                )
+            )
+    if world_size > 1:
+        stats = torch.tensor(
+            [total_loss, float(batches)],
+            dtype=torch.float64,
+            device=device,
         )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss = float(stats[0].item())
+        batches = int(round(float(stats[1].item())))
     if batches == 0:
         raise RuntimeError(f"{stage} loader produced no batches")
     mean_loss = total_loss / batches
@@ -994,14 +1091,16 @@ def _run_jepa_epoch(
         "batches": batches,
         "elapsed_s": time.perf_counter() - started,
     }
-    logger.info(
-        "epoch=%d stage=%s_done batches=%d jepa_loss=%.6f elapsed_s=%.3f",
-        epoch,
-        stage,
-        batches,
-        mean_loss,
-        metrics["elapsed_s"],
-    )
+    if int(rank) == 0:
+        logger.info(
+            "epoch=%d stage=%s_done %s batches=%d jepa_loss=%.6f time=%.3fs",
+            epoch,
+            stage,
+            _format_progress(batches, batches),
+            batches,
+            mean_loss,
+            metrics["elapsed_s"],
+        )
     return metrics
 
 
@@ -1018,10 +1117,13 @@ def _end_to_end_checkpoint(
     kind,
     best_epoch=None,
     experiment_mode="optical_qkv",
+    world_size=1,
+    gpu_ids=None,
 ):
+    predictor_model = _unwrap_module(predictor)
     predictor_state = {
         key: value.detach().cpu().clone()
-        for key, value in predictor.state_dict().items()
+        for key, value in predictor_model.state_dict().items()
     }
     checkpoint_mode = {
         "optical_qkv": "end_to_end_jepa",
@@ -1057,6 +1159,8 @@ def _end_to_end_checkpoint(
         "feedback_layer_index": 2,
         "readout_mode": "intensity_minus_learnable_offset",
         "differential_detector": False,
+        "world_size": int(world_size),
+        "gpu_ids": list(gpu_ids or []),
         "onn": copy.deepcopy(
             args_eval.get("onn", args_eval.get("onn_feedback", {}))
         ),
@@ -1117,7 +1221,9 @@ def _load_end_to_end_checkpoint(
         raise ValueError(
             f"{expected_mode} checkpoint config does not match the current config"
         )
-    predictor.load_state_dict(checkpoint["predictor"], strict=True)
+    _unwrap_module(predictor).load_state_dict(
+        checkpoint["predictor"], strict=True
+    )
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -1178,6 +1284,8 @@ def run(
     split_manifest=None,
     last_output=None,
     skip_final_eval=False,
+    device=None,
+    gpu_id=0,
 ):
     if _resolve_experiment_mode(args_eval) != "realtime_last_node_distillation":
         raise ValueError(
@@ -1188,7 +1296,8 @@ def run(
         log_path = f"{output_path}.log"
     logger = _configure_logging(log_path)
     run_started = time.perf_counter()
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = _device_for_gpu(gpu_id, world_size=1)
     training_cfg = args_eval.get("training", {})
     split_cfg = args_eval.get("data_split", {})
     epochs = int(training_cfg.get("epochs", 1) if epochs is None else epochs)
@@ -1389,6 +1498,11 @@ def run_end_to_end_jepa(
     resume_checkpoint=None,
     skip_final_eval=False,
     experiment_mode="optical_qkv",
+    device=None,
+    gpu_id=0,
+    rank=0,
+    world_size=1,
+    gpu_ids=None,
 ):
     if experiment_mode not in {"optical_qkv", "electronic_control", "onn_feedback"}:
         raise ValueError(
@@ -1396,9 +1510,13 @@ def run_end_to_end_jepa(
         )
     if log_path is None:
         log_path = f"{output_path}.log"
-    logger = _configure_logging(log_path)
+    logger = _configure_logging(log_path, rank=rank)
     run_started = time.perf_counter()
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = _device_for_gpu(gpu_id, world_size=world_size)
+    if world_size > 1 and not dist.is_initialized():
+        raise RuntimeError("multi-GPU training requires an initialized process group")
+    gpu_ids = list(gpu_ids or [gpu_id])
     training_cfg = args_eval.get("training", {})
     split_cfg = args_eval.get("data_split", {})
     epochs = int(training_cfg.get("epochs", 1) if epochs is None else epochs)
@@ -1453,6 +1571,13 @@ def run_end_to_end_jepa(
             args_eval, device, experiment_mode=experiment_mode
         )
     )
+    if world_size > 1:
+        predictor = DistributedDataParallel(
+            predictor,
+            device_ids=[int(gpu_id)],
+            output_device=int(gpu_id),
+            broadcast_buffers=True,
+        )
     _sync_for_timing(device)
     logger.info("model_prepare_done elapsed_s=%.3f", time.perf_counter() - model_started)
     trainable = [
@@ -1489,12 +1614,16 @@ def run_end_to_end_jepa(
         split["train_video_ids"],
         deterministic=False,
         collator=_make_jepa_mask_collator(args_eval),
+        world_size=world_size,
+        rank=rank,
     )
     val_loader = _make_jepa_loader(
         args_eval,
         split["val_video_ids"],
         deterministic=True,
         collator=None,
+        world_size=world_size,
+        rank=rank,
     )
     logger.info(
         "data_loaders_ready experiment_mode=%s batch_size=%s train_batches=%d "
@@ -1541,6 +1670,8 @@ def run_end_to_end_jepa(
             training=False,
             max_steps=max_steps,
             clip_grad=clip_grad,
+            rank=rank,
+            world_size=world_size,
         )
         best_val_loss = initial_val_metrics["jepa_loss"]
         best_epoch = 0
@@ -1557,8 +1688,13 @@ def run_end_to_end_jepa(
             "best",
             best_epoch=0,
             experiment_mode=experiment_mode,
+            world_size=world_size,
+            gpu_ids=gpu_ids,
         )
-        _save_checkpoint(best_checkpoint, output_path)
+        if rank == 0:
+            _save_checkpoint(best_checkpoint, output_path)
+        if world_size > 1:
+            dist.barrier()
         logger.info(
             "best_checkpoint_saved experiment_mode=%s epoch=0 "
             "val_jepa_loss=%.6f path=%s",
@@ -1580,6 +1716,8 @@ def run_end_to_end_jepa(
             training=True,
             max_steps=max_steps,
             clip_grad=clip_grad,
+            rank=rank,
+            world_size=world_size,
         )
         global_step += train_metrics["batches"]
         val_metrics = _run_jepa_epoch(
@@ -1595,6 +1733,8 @@ def run_end_to_end_jepa(
             training=False,
             max_steps=max_steps,
             clip_grad=clip_grad,
+            rank=rank,
+            world_size=world_size,
         )
         scheduler.step()
         improved = val_metrics["jepa_loss"] < best_val_loss
@@ -1613,8 +1753,13 @@ def run_end_to_end_jepa(
                 args_eval,
                 "best",
                 experiment_mode=experiment_mode,
+                world_size=world_size,
+                gpu_ids=gpu_ids,
             )
-            _save_checkpoint(best_checkpoint, output_path)
+            if rank == 0:
+                _save_checkpoint(best_checkpoint, output_path)
+            if world_size > 1:
+                dist.barrier()
             logger.info(
                 "best_checkpoint_saved experiment_mode=%s epoch=%d "
                 "val_jepa_loss=%.6f path=%s",
@@ -1636,8 +1781,13 @@ def run_end_to_end_jepa(
             "last",
             best_epoch=best_epoch,
             experiment_mode=experiment_mode,
+            world_size=world_size,
+            gpu_ids=gpu_ids,
         )
-        _save_checkpoint(last_checkpoint, last_output)
+        if rank == 0:
+            _save_checkpoint(last_checkpoint, last_output)
+        if world_size > 1:
+            dist.barrier()
         logger.info(
             "epoch_done experiment_mode=%s epoch=%d train_jepa_loss=%.6f "
             "val_jepa_loss=%.6f best_val_jepa_loss=%.6f improved=%s "
@@ -1650,24 +1800,34 @@ def run_end_to_end_jepa(
             improved,
             time.perf_counter() - run_started,
         )
-    if best_checkpoint is None:
-        if resume_checkpoint is not None and Path(output_path).exists():
-            best_checkpoint = torch.load(
-                output_path, map_location="cpu", weights_only=False
-            )
-        else:
-            raise RuntimeError("no best end_to_end_jepa checkpoint was produced")
-    logger.info(
-        "run_done experiment_mode=%s best_epoch=%d "
-        "best_val_jepa_loss=%.6f best=%s last=%s "
-        "final_checkpoint=disabled elapsed_s=%.3f",
-        experiment_mode,
-        best_epoch,
-        best_val_loss,
-        os.path.abspath(output_path),
-        os.path.abspath(last_output),
-        time.perf_counter() - run_started,
-    )
+    if rank == 0:
+        if best_checkpoint is None:
+            if resume_checkpoint is not None and Path(output_path).exists():
+                best_checkpoint = torch.load(
+                    output_path, map_location="cpu", weights_only=False
+                )
+            else:
+                raise RuntimeError("no best end_to_end_jepa checkpoint was produced")
+        logger.info(
+            "run_done experiment_mode=%s world_size=%d gpu_ids=%s best_epoch=%d "
+            "best_val_jepa_loss=%.6f best=%s last=%s "
+            "final_checkpoint=disabled elapsed_s=%.3f",
+            experiment_mode,
+            world_size,
+            gpu_ids,
+            best_epoch,
+            best_val_loss,
+            os.path.abspath(output_path),
+            os.path.abspath(last_output),
+            time.perf_counter() - run_started,
+        )
+
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank != 0:
+        return None
+
     if (
         not skip_final_eval
         and bool(args_eval.get("evaluation", {}).get("run_after_training", True))
@@ -1676,6 +1836,75 @@ def run_end_to_end_jepa(
             args_eval, output_path, Path(output_path).parent, logger
         )
     return best_checkpoint
+
+
+
+def _run_selected_mode(
+    config,
+    args,
+    outputs,
+    rank=0,
+    world_size=1,
+    gpu_ids=None,
+    device=None,
+):
+    gpu_ids = list(gpu_ids or [0])
+    mode = _resolve_experiment_mode(config)
+    if mode == "realtime_last_node_distillation":
+        if world_size > 1:
+            raise ValueError(
+                "multi-GPU mode is supported for end-to-end training only; "
+                "realtime_last_node_distillation remains single-GPU"
+            )
+        if args.resume is not None:
+            raise ValueError(
+                "realtime_last_node_distillation does not use --resume"
+            )
+        return run(
+            config,
+            output_path=outputs["output"],
+            block=args.block,
+            max_steps=args.max_steps,
+            learning_rate=args.learning_rate,
+            log_path=_path_in_run_dir(
+                outputs["run_dir"], args.log_file, outputs["log"]
+            ),
+            epochs=args.epochs,
+            split_manifest=_path_in_run_dir(
+                outputs["run_dir"], args.split_manifest, outputs["split_manifest"]
+            ),
+            last_output=_path_in_run_dir(
+                outputs["run_dir"], args.last_output, outputs["last_output"]
+            ),
+            skip_final_eval=args.skip_final_eval,
+            device=device,
+            gpu_id=gpu_ids[rank],
+        )
+    if mode in {"onn_feedback", "optical_qkv", "electronic_control"}:
+        return run_end_to_end_jepa(
+            config,
+            output_path=outputs["output"],
+            max_steps=args.max_steps,
+            learning_rate=args.learning_rate,
+            log_path=_path_in_run_dir(
+                outputs["run_dir"], args.log_file, outputs["log"]
+            ),
+            epochs=args.epochs,
+            split_manifest=args.split_manifest,
+            last_output=_path_in_run_dir(
+                outputs["run_dir"], args.last_output, outputs["last_output"]
+            ),
+            final_output=outputs["final_output"],
+            resume_checkpoint=args.resume,
+            skip_final_eval=args.skip_final_eval,
+            experiment_mode=mode,
+            device=device,
+            gpu_id=gpu_ids[rank],
+            rank=rank,
+            world_size=world_size,
+            gpu_ids=gpu_ids,
+        )
+    raise ValueError(f"unsupported training mode: {mode}")
 
 
 def main():
@@ -1694,9 +1923,34 @@ def main():
     )
     parser.add_argument(
         "--experiment-mode",
-        choices=("onn_feedback", "electronic_control", "optical_qkv", "realtime_last_node_distillation"),
+        choices=(
+            "onn_feedback",
+            "electronic_control",
+            "optical_qkv",
+            "realtime_last_node_distillation",
+        ),
         default=None,
         help="end-to-end experiment mode",
+    )
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help="single visible CUDA GPU id; defaults to 0",
+    )
+    gpu_group.add_argument(
+        "--gpus",
+        type=int,
+        nargs="+",
+        default=None,
+        help="visible CUDA GPU ids for one DDP process per GPU",
+    )
+    parser.add_argument(
+        "--dist-port",
+        type=int,
+        default=29517,
+        help="local TCP port used by the internally launched DDP processes",
     )
     parser.add_argument(
         "--block",
@@ -1724,6 +1978,12 @@ def main():
     parser.add_argument("--resume", default=None)
     parser.add_argument("--skip-final-eval", action="store_true")
     args = parser.parse_args()
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "do not combine this launcher with torchrun; pass --gpu or --gpus "
+            "to train_optical.py directly"
+        )
+
     config = _apply_cli_overrides(
         _load_config(args.config),
         batch_size=args.batch_size,
@@ -1739,53 +1999,25 @@ def main():
         }[args.mode]
     if args.experiment_mode is not None:
         training_cfg["experiment_mode"] = args.experiment_mode
-    mode = _resolve_experiment_mode(config)
-    if mode == "realtime_last_node_distillation":
-        if args.resume is not None:
-            raise ValueError(
-                "realtime_last_node_distillation does not use --resume"
-            )
-        run(
-            config,
-            output_path=outputs["output"],
-            block=args.block,
-            max_steps=args.max_steps,
-            learning_rate=args.learning_rate,
-            log_path=_path_in_run_dir(
-                outputs["run_dir"], args.log_file, outputs["log"]
-            ),
-            epochs=args.epochs,
-            split_manifest=_path_in_run_dir(
-                outputs["run_dir"], args.split_manifest, outputs["split_manifest"]
-            ),
-            last_output=_path_in_run_dir(
-                outputs["run_dir"], args.last_output, outputs["last_output"]
-            ),
-            skip_final_eval=args.skip_final_eval,
-        )
-    elif mode in {"onn_feedback", "optical_qkv", "electronic_control"}:
-        run_end_to_end_jepa(
-            config,
-            output_path=outputs["output"],
-            max_steps=args.max_steps,
-            learning_rate=args.learning_rate,
-            log_path=_path_in_run_dir(
-                outputs["run_dir"], args.log_file, outputs["log"]
-            ),
-            epochs=args.epochs,
-            split_manifest=_path_in_run_dir(
-                outputs["run_dir"], args.split_manifest, outputs["split_manifest"]
-            ),
-            last_output=_path_in_run_dir(
-                outputs["run_dir"], args.last_output, outputs["last_output"]
-            ),
-            final_output=outputs["final_output"],
-            resume_checkpoint=args.resume,
-            skip_final_eval=args.skip_final_eval,
-            experiment_mode=mode,
+
+    gpu_ids = _resolve_gpu_ids(args.gpu, args.gpus)
+    if len(gpu_ids) > 1:
+        mp.spawn(
+            _distributed_worker,
+            args=(config, args, outputs, gpu_ids),
+            nprocs=len(gpu_ids),
+            join=True,
         )
     else:
-        raise ValueError(f"unsupported training mode: {mode}")
+        _run_selected_mode(
+            config,
+            args,
+            outputs,
+            rank=0,
+            world_size=1,
+            gpu_ids=gpu_ids,
+            device=None,
+        )
 
 
 if __name__ == "__main__":

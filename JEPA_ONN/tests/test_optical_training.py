@@ -1,7 +1,9 @@
 import json
+import sys
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +23,10 @@ from evals.intuitive_physics.train_optical import (
     _extract_jepa_clips,
     _last_checkpoint_path,
     _load_end_to_end_checkpoint,
+    _make_jepa_loader,
     _save_checkpoint,
     _require_existing_video_split,
+    _resolve_gpu_ids,
 )
 from evals.intuitive_physics.optical_split import (
     build_video_split,
@@ -49,6 +53,134 @@ class ExistingSplitTests(unittest.TestCase):
                     num_val_videos=1,
                     split_seed=42,
                 )
+
+
+class MultiGpuSelectionTests(unittest.TestCase):
+    def test_single_gpu_selection(self):
+        self.assertEqual(_resolve_gpu_ids(gpu=3, gpus=None), [3])
+
+    def test_multi_gpu_selection_preserves_order(self):
+        self.assertEqual(_resolve_gpu_ids(gpu=None, gpus=[0, 2, 3]), [0, 2, 3])
+
+    def test_gpu_selection_rejects_conflicts_and_duplicates(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _resolve_gpu_ids(gpu=0, gpus=[1, 2])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            _resolve_gpu_ids(gpu=None, gpus=[1, 1])
+
+
+class DistributedLoaderContractTests(unittest.TestCase):
+    def test_jepa_loader_forwards_rank_and_world_size(self):
+        from evals.intuitive_physics import train_optical
+
+        args_eval = {
+            "data": {"frames_per_clip": 16, "resolution": 224},
+            "pretrain": {"patch_size": 16, "tubelet_size": 2},
+        }
+        fake_loader = object()
+        with patch.object(
+            train_optical, "make_transforms", return_value="transform"
+        ):
+            with patch.object(
+                train_optical,
+                "init_data",
+                return_value=(fake_loader, "sampler"),
+            ) as init_data:
+                result = _make_jepa_loader(
+                    args_eval,
+                    ["video-1"],
+                    deterministic=True,
+                    collator=None,
+                    world_size=2,
+                    rank=1,
+                )
+
+        self.assertIs(result, fake_loader)
+        self.assertEqual(init_data.call_args.kwargs["world_size"], 2)
+        self.assertEqual(init_data.call_args.kwargs["rank"], 1)
+
+
+class MultiGpuEntrypointTests(unittest.TestCase):
+    def test_multi_gpu_entrypoint_spawns_one_process_per_gpu(self):
+        from evals.intuitive_physics import train_optical
+
+        outputs = {
+            "run_dir": Path("/data/linux/wkx/IntPhys/onn_run"),
+            "output": Path("/data/linux/wkx/IntPhys/onn_run/best.pt"),
+            "last_output": Path("/data/linux/wkx/IntPhys/onn_run/last.pt"),
+            "final_output": Path("/data/linux/wkx/IntPhys/onn_run/final.pt"),
+            "log": Path("/data/linux/wkx/IntPhys/onn_run/train.log"),
+            "split_manifest": Path("/data/linux/wkx/IntPhys/onn_run/split.json"),
+        }
+        argv = [
+            "train_optical.py",
+            "--config", "onn.yaml",
+            "--output", "onn_train",
+            "--gpus", "0", "2",
+        ]
+        with patch.object(
+            train_optical, "_load_config",
+            return_value={"training": {"experiment_mode": "onn_feedback"}},
+        ):
+            with patch.object(
+                train_optical, "_resolve_run_outputs", return_value=outputs
+            ):
+                with patch.object(train_optical.mp, "spawn") as spawn:
+                    with patch.object(sys, "argv", argv):
+                        train_optical.main()
+
+        self.assertEqual(spawn.call_args.kwargs["nprocs"], 2)
+        self.assertEqual(spawn.call_args.kwargs["args"][-1], [0, 2])
+
+
+class EntrypointSplitManifestTests(unittest.TestCase):
+    def _run_main(self, extra_args):
+        from evals.intuitive_physics import train_optical
+
+        outputs = {
+            "run_dir": Path("/data/linux/wkx/IntPhys/onn_run"),
+            "output": Path("/data/linux/wkx/IntPhys/onn_run/best.pt"),
+            "last_output": Path("/data/linux/wkx/IntPhys/onn_run/last.pt"),
+            "final_output": Path("/data/linux/wkx/IntPhys/onn_run/final.pt"),
+            "log": Path("/data/linux/wkx/IntPhys/onn_run/train.log"),
+            "split_manifest": Path(
+                "/data/linux/wkx/IntPhys/onn_run/generated.split.json"
+            ),
+        }
+        argv = [
+            "train_optical.py",
+            "--config", "onn.yaml",
+            "--output", "onn_smoke",
+            "--epochs", "1",
+            "--max-steps", "1",
+            "--skip-final-eval",
+        ] + list(extra_args)
+        config = {"training": {"experiment_mode": "onn_feedback"}}
+
+        with patch.object(train_optical, "_load_config", return_value=config):
+            with patch.object(
+                train_optical, "_resolve_run_outputs", return_value=outputs
+            ):
+                with patch.object(
+                    train_optical,
+                    "_resolve_experiment_mode",
+                    return_value="onn_feedback",
+                ):
+                    with patch.object(
+                        train_optical, "run_end_to_end_jepa"
+                    ) as run:
+                        with patch.object(sys, "argv", argv):
+                            train_optical.main()
+        return run.call_args.kwargs
+
+    def test_onn_entrypoint_leaves_missing_manifest_for_config_resolution(self):
+        kwargs = self._run_main([])
+        self.assertIsNone(kwargs["split_manifest"])
+
+    def test_onn_entrypoint_preserves_explicit_manifest_path(self):
+        manifest = "/data/linux/wkx/IntPhys/references/splits/intphys_train_val.json"
+        kwargs = self._run_main(["--split-manifest", manifest])
+        self.assertEqual(kwargs["split_manifest"], manifest)
 
 
 class OpticalSplitTests(unittest.TestCase):

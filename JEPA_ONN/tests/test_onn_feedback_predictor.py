@@ -55,6 +55,17 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
         self.assertEqual(predictor.last_trace["pred_tgt_384_shape"], (1, 1560, 384))
         self.assertEqual(predictor.last_trace["pred_tgt_1024_shape"], (1, 1560, 1024))
 
+    def test_partial_masks_are_allowed_and_report_missing_count(self):
+        predictor = self.make_predictor()
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        masks_tgt = torch.arange(8, 1008, dtype=torch.long).unsqueeze(0)
+
+        output = predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertEqual(tuple(output.shape), (1, 1000, 1024))
+        self.assertEqual(predictor.last_trace["missing_count"], 560)
+
     def test_mask_token_mode_does_not_read_real_target(self):
         predictor = self.make_predictor()
         context = torch.randn(1, 8, 1024)
@@ -78,6 +89,15 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             predictor.onn_core.feedback_seen,
             [False, True, True, True, True, True, True, True],
         )
+
+    def test_overlapping_masks_are_rejected(self):
+        predictor = self.make_predictor()
+        context = torch.randn(1, 2, 1024)
+        masks_ctxt = torch.tensor([[0, 1]], dtype=torch.long)
+        masks_tgt = torch.tensor([[1, 2]], dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "overlap or duplicate"):
+            predictor(context, None, masks_ctxt, masks_tgt)
 
     def test_invalid_fixed_token_index_is_rejected(self):
         predictor = self.make_predictor()

@@ -513,14 +513,17 @@ class ONNFeedbackPredictor(nn.Module):
             raise ValueError("masks_ctxt indices must be in [0,1567]")
         if torch.any(masks_tgt < 0) or torch.any(masks_tgt >= self.num_tokens):
             raise ValueError("masks_tgt indices must be in [0,1567]")
-        if masks_ctxt.shape[1] + masks_tgt.shape[1] != self.num_tokens:
-            raise ValueError("context and target masks must cover all 1568 tokens")
+
+        missing_counts = []
         for batch_index in range(batch_size):
             merged = torch.cat(
                 (masks_ctxt[batch_index], masks_tgt[batch_index]), dim=0
             )
-            if torch.unique(merged).numel() != self.num_tokens:
-                raise ValueError("masks_ctxt and masks_tgt overlap or omit a token")
+            unique_count = torch.unique(merged).numel()
+            if unique_count != merged.numel():
+                raise ValueError("masks_ctxt and masks_tgt overlap or duplicate a token")
+            missing_counts.append(self.num_tokens - unique_count)
+        return missing_counts
 
     def forward(
         self,
@@ -538,7 +541,9 @@ class ONNFeedbackPredictor(nn.Module):
             )
         if masks_ctxt is None or masks_tgt is None:
             raise ValueError("ONN feedback Predictor requires both mask indices")
-        self._validate_masks(masks_ctxt, masks_tgt, ctxt.shape[0])
+        missing_counts = self._validate_masks(
+            masks_ctxt, masks_tgt, ctxt.shape[0]
+        )
 
         batch_size = ctxt.shape[0]
         context_384 = self.predictor_embed(ctxt)
@@ -610,6 +615,11 @@ class ONNFeedbackPredictor(nn.Module):
             "pred_tgt_1024_shape": tuple(pred_tgt_1024.shape),
             "n_ctxt": int(masks_ctxt.shape[1]),
             "n_tgt": int(masks_tgt.shape[1]),
+            "missing_count": (
+                missing_counts[0]
+                if len(set(missing_counts)) <= 1
+                else missing_counts
+            ),
             "current_chunk": self.num_chunks,
             "num_chunks": self.num_chunks,
             "feedback_layer_index": self.feedback_layer_index,
