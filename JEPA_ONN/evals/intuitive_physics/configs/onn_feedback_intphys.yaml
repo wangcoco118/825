@@ -56,8 +56,10 @@ onn:
   input_dim: 384
   output_dim: 384
   num_slm_layers: 4
-  feedback_mode: fixed_middle
+  feedback_mode: fixed_middle_phase
   feedback_layer_index: 2
+  feedback_phase_max_rad: 1.5707963267948966
+  feedback_gain_init: 1.0
   readout_mode: intensity_minus_learnable_offset
   learnable_intensity_offset: true
   use_differential_detector: false

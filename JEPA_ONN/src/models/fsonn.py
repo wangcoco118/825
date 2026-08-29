@@ -21,8 +21,10 @@ class ONNConfig:
     chunk_tokens: int = 196
     grid_height: int = 196
     grid_width: int = 384
-    feedback_mode: str = "fixed_middle"
+    feedback_mode: str = "fixed_middle_phase"
     feedback_layer_index: int = 2
+    feedback_phase_max_rad: float = 1.5707963267948966
+    feedback_gain_init: float = 1.0
     readout_mode: str = "intensity_minus_learnable_offset"
     input_encoding_mode: str = "signed_phase"
     pixel_pitch_um: float = 8.0
@@ -68,6 +70,8 @@ class ONNConfig:
         return cls(**normalized)
 
     def __post_init__(self):
+        if self.feedback_mode == "fixed_middle":
+            object.__setattr__(self, "feedback_mode", "fixed_middle_phase")
         positive = (
             self.input_dim,
             self.output_dim,
@@ -87,8 +91,12 @@ class ONNConfig:
             raise ValueError("single-detector ONN requires input_dim == output_dim")
         if self.grid_height != self.chunk_tokens or self.grid_width != self.output_dim:
             raise ValueError("ONN grid must be [chunk_tokens, output_dim]")
-        if self.feedback_mode != "fixed_middle":
-            raise ValueError("only feedback_mode='fixed_middle' is supported")
+        if self.feedback_mode != "fixed_middle_phase":
+            raise ValueError("only feedback_mode='fixed_middle_phase' is supported")
+        if self.feedback_phase_max_rad <= 0:
+            raise ValueError("feedback_phase_max_rad must be positive")
+        if self.feedback_gain_init <= 0:
+            raise ValueError("feedback_gain_init must be positive")
         if self.readout_mode != "intensity_minus_learnable_offset":
             raise ValueError("only intensity_minus_learnable_offset is supported")
         if self.input_encoding_mode != "signed_phase":
@@ -116,6 +124,18 @@ class FeedbackFSONN(nn.Module):
             ]
         )
         self.input_scale_raw = nn.Parameter(torch.zeros(()))
+        self.feedback_norm = nn.LayerNorm(
+            config.output_dim,
+            elementwise_affine=False,
+        )
+        initial_softplus = torch.tensor(
+            max(config.feedback_gain_init - config.eps, torch.finfo(torch.float32).tiny),
+            dtype=torch.float32,
+        )
+        feedback_gain_raw = initial_softplus + torch.log(
+            -torch.expm1(-initial_softplus)
+        )
+        self.feedback_gain_raw = nn.Parameter(feedback_gain_raw)
         self.intensity_offset = (
             nn.Parameter(torch.zeros(1, 1, config.output_dim))
             if config.learnable_intensity_offset
@@ -124,6 +144,11 @@ class FeedbackFSONN(nn.Module):
 
     def _positive_parameter(self, raw: torch.Tensor) -> torch.Tensor:
         return F.softplus(raw) + self.config.eps
+
+    def _feedback_to_phase(self, feedback: torch.Tensor) -> torch.Tensor:
+        normalized = self.feedback_norm(feedback)
+        gain = self._positive_parameter(self.feedback_gain_raw)
+        return self.config.feedback_phase_max_rad * torch.tanh(gain * normalized)
 
     def _encode(self, slot: torch.Tensor) -> torch.Tensor:
         scale = self._positive_parameter(self.input_scale_raw)
@@ -159,6 +184,7 @@ class FeedbackFSONN(nn.Module):
             self.config.wavelength_nm,
             self.config.asm_padding_factor,
         )
+        feedback_phase = None
         if feedback is not None:
             if feedback.shape != slot.shape:
                 raise ValueError("feedback must match the current slot shape")
@@ -169,14 +195,24 @@ class FeedbackFSONN(nn.Module):
             )
             if not 0 <= index < len(self.slm_layers):
                 raise ValueError("feedback_layer_index must identify an existing SLM layer")
+            feedback_phase = self._feedback_to_phase(feedback)
         else:
             index = -1
 
-        debug = {}
+        debug = {
+            "feedback_gain": self._positive_parameter(self.feedback_gain_raw),
+            "feedback_phase": feedback_phase,
+            "feedback_phase_abs_max": (
+                feedback_phase.abs().max()
+                if feedback_phase is not None
+                else torch.zeros((), device=slot.device, dtype=slot.dtype)
+            ),
+            "feedback_layer_index": index,
+            "feedback_used": feedback is not None,
+        }
         for layer_index, slm in enumerate(self.slm_layers):
-            if feedback is not None and layer_index == index:
-                field = field + self._encode(feedback)
-            field = slm(field)
+            phase_delta = feedback_phase if layer_index == index else None
+            field = slm(field, phase_delta=phase_delta)
             debug[f"slm_{layer_index + 1}_field"] = field
             if layer_index < len(self.slm_layers) - 1:
                 field = band_limited_angular_spectrum(
@@ -443,9 +479,19 @@ class PhaseSLM(nn.Module):
         super().__init__()
         self.phase_logits = nn.Parameter(torch.zeros(height, width))
 
-    def forward(self, field: torch.Tensor) -> torch.Tensor:
-        phase = 2.0 * torch.pi * torch.sigmoid(self.phase_logits)
-        return field * torch.polar(torch.ones_like(phase), phase).to(field.dtype)
+    def forward(
+        self,
+        field: torch.Tensor,
+        phase_delta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        base_phase = 2.0 * torch.pi * torch.sigmoid(self.phase_logits)
+        total_phase = base_phase
+        if phase_delta is not None:
+            total_phase = total_phase + phase_delta
+        return field * torch.polar(
+            torch.ones_like(total_phase),
+            total_phase,
+        ).to(field.dtype)
 
 
 class TimeDivisionFSONN(nn.Module):

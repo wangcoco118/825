@@ -404,7 +404,7 @@ class ONNFeedbackPredictor(nn.Module):
         num_chunks=8,
         chunk_tokens=196,
         output_mlp_hidden_dim=384,
-        feedback_mode="fixed_middle",
+        feedback_mode="fixed_middle_phase",
         feedback_layer_index=None,
         uniform_power=False,
         optical_config=None,
@@ -415,8 +415,10 @@ class ONNFeedbackPredictor(nn.Module):
             raise ValueError("ONN feedback Predictor requires 1568 = 8 * 196 tokens")
         if num_chunks * chunk_tokens != num_tokens:
             raise ValueError("num_chunks * chunk_tokens must equal num_tokens")
-        if feedback_mode != "fixed_middle":
-            raise ValueError("only feedback_mode='fixed_middle' is supported")
+        if feedback_mode == "fixed_middle":
+            feedback_mode = "fixed_middle_phase"
+        if feedback_mode != "fixed_middle_phase":
+            raise ValueError("only feedback_mode='fixed_middle_phase' is supported")
 
         self.embed_dim = int(embed_dim)
         self.predictor_embed_dim = int(predictor_embed_dim)
@@ -474,7 +476,6 @@ class ONNFeedbackPredictor(nn.Module):
         slm_layers = getattr(self.onn_core, "slm_layers", ())
         if slm_layers and not 0 <= self.feedback_layer_index < len(slm_layers):
             raise ValueError("feedback_layer_index must identify an existing SLM layer")
-        self.feedback_adapter = nn.Identity()
         self.last_trace = {}
 
     def _init_pos_embed(
@@ -574,13 +575,13 @@ class ONNFeedbackPredictor(nn.Module):
             batch_size, self.num_chunks, self.chunk_tokens, self.predictor_embed_dim
         )
 
-        feedback = None
+        previous_output = None
         outputs = []
         for chunk_index in range(self.num_chunks):
             x_chunk = chunks[:, chunk_index]
             result = self.onn_core(
                 x_chunk,
-                feedback=feedback,
+                feedback=previous_output,
                 feedback_layer_index=self.feedback_layer_index,
             )
             if isinstance(result, (tuple, list)):
@@ -594,8 +595,12 @@ class ONNFeedbackPredictor(nn.Module):
                 )
             if not torch.isfinite(y_chunk).all():
                 raise FloatingPointError("ONN output contains NaN or Inf")
+            if feedback_source.shape != x_chunk.shape:
+                raise ValueError(
+                    "ONN feedback source must match the current chunk shape"
+                )
             outputs.append(y_chunk)
-            feedback = self.feedback_adapter(feedback_source)
+            previous_output = feedback_source
 
         dense_output = torch.cat(outputs, dim=1)
         dense_output = self.predictor_norm(dense_output)
@@ -623,6 +628,7 @@ class ONNFeedbackPredictor(nn.Module):
             "current_chunk": self.num_chunks,
             "num_chunks": self.num_chunks,
             "feedback_layer_index": self.feedback_layer_index,
+            "feedback_mode": self.feedback_mode,
         }
         return pred_tgt_1024
 
