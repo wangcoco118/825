@@ -88,6 +88,8 @@ class TrainLoggingTests(unittest.TestCase):
                 "feedback_gain_mode": "independent",
                 "feedback_gain_init": [0.5, 1.5, 3.0],
                 "feedback_phase_max_rad": 0.75,
+                "feedback_memory_enabled": True,
+                "feedback_memory_alpha": 0.8,
                 "slm_intervals_um": [8.0, 8.0, 8.0, 8.0],
                 "input_to_first_slm_um": 8.0,
                 "last_slm_to_detector_um": 8.0,
@@ -110,6 +112,12 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertEqual(metadata["physical_feedback_layers"], [3, 4, 5])
         self.assertEqual(metadata["feedback_gain_mode"], "independent")
         self.assertEqual(metadata["feedback_gain_parameter_count"], 3)
+        self.assertTrue(metadata["feedback_memory_enabled"])
+        self.assertEqual(metadata["feedback_memory_alpha"], 0.8)
+        self.assertEqual(
+            metadata["feedback_memory_update"],
+            "H0=Z0; Ht=0.8*Hprev+0.2*Zt",
+        )
         self.assertTrue(
             torch.allclose(
                 torch.tensor(metadata["effective_feedback_gains"]),
@@ -122,6 +130,12 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertIn("SLM3_K=0.500000", message)
         self.assertIn("SLM4_K=1.500000", message)
         self.assertIn("SLM5_K=3.000000", message)
+        self.assertIn("feedback_memory_enabled=true", message)
+        self.assertIn("feedback_memory_alpha=0.8", message)
+        self.assertIn(
+            "feedback_memory_update=H0=Z0; Ht=0.8*Hprev+0.2*Zt",
+            message,
+        )
 
         optimizer = torch.optim.AdamW(predictor.parameters(), lr=1e-3)
         checkpoint = train_optical._end_to_end_checkpoint(

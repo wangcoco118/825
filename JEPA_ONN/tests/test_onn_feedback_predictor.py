@@ -16,17 +16,28 @@ class RecordingONN(nn.Module):
             [nn.Identity() for _ in range(num_slm_layers)]
         )
         self.feedback_values = []
+        self.feedback_states = []
         self.feedback_layer_indices_seen = []
         self.outputs = []
+        self.normalized_outputs = []
+
+    def normalize_feedback_output(self, output):
+        normalized = output - output.mean(dim=-1, keepdim=True)
+        self.normalized_outputs.append(normalized)
+        return normalized
 
     def forward(
         self,
         x,
         feedback=None,
+        feedback_state=None,
         feedback_layer_index=None,
         feedback_layer_indices=None,
     ):
+        if feedback is not None and feedback_state is not None:
+            raise ValueError("feedback and feedback_state are mutually exclusive")
         self.feedback_values.append(feedback)
+        self.feedback_states.append(feedback_state)
         indices = feedback_layer_indices
         if indices is None and feedback_layer_index is not None:
             indices = (feedback_layer_index,)
@@ -34,7 +45,29 @@ class RecordingONN(nn.Module):
             None if indices is None else tuple(indices)
         )
         output = self.projection(x)
+        if feedback is not None:
+            normalized_feedback = feedback - feedback.mean(
+                dim=-1, keepdim=True
+            )
+            output = output + 0.1 * normalized_feedback
+        elif feedback_state is not None:
+            output = output + 0.1 * feedback_state
         self.outputs.append(output)
+        return output, output
+
+
+class LegacyRecordingONN(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.projection = nn.Linear(dim, dim)
+        self.slm_layers = nn.ModuleList([nn.Identity() for _ in range(4)])
+
+    def forward(self, x, feedback=None, feedback_layer_index=None):
+        output = self.projection(x)
+        if feedback is not None:
+            output = output + 0.1 * (
+                feedback - feedback.mean(dim=-1, keepdim=True)
+            )
         return output, output
 
 
@@ -159,6 +192,219 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
                 feedback_values[chunk_index],
                 predictor.onn_core.outputs[chunk_index - 1],
             )
+
+    def test_memory_disabled_preserves_legacy_core_call_signature(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            feedback_memory_enabled=False,
+            onn_core=LegacyRecordingONN(384),
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        output = predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertEqual(tuple(output.shape), (1, 1560, 1024))
+
+    def test_memory_configuration_defaults_and_validation(self):
+        default = small_onn_config()
+        self.assertFalse(default.feedback_memory_enabled)
+        self.assertEqual(default.feedback_memory_alpha, 0.8)
+
+        enabled = small_onn_config(
+            feedback_memory_enabled=True,
+            feedback_memory_alpha=0.8,
+        )
+        self.assertTrue(enabled.feedback_memory_enabled)
+        self.assertEqual(enabled.feedback_memory_alpha, 0.8)
+
+        for alpha in (-0.1, 1.0, 1.5):
+            with self.subTest(alpha=alpha):
+                with self.assertRaisesRegex(ValueError, "feedback_memory_alpha"):
+                    small_onn_config(feedback_memory_alpha=alpha)
+        with self.assertRaisesRegex(ValueError, "feedback is disabled"):
+            small_onn_config(
+                feedback_enabled=False,
+                feedback_memory_enabled=True,
+            )
+
+    def test_memory_update_formula_has_unscaled_initial_state(self):
+        z0 = torch.tensor([[[1.0, 2.0]]])
+        z1 = torch.tensor([[[3.0, 5.0]]])
+        z2 = torch.tensor([[[7.0, 11.0]]])
+
+        h0 = ONNFeedbackPredictor._update_feedback_memory(None, z0, 0.8)
+        h1 = ONNFeedbackPredictor._update_feedback_memory(h0, z1, 0.8)
+        h2 = ONNFeedbackPredictor._update_feedback_memory(h1, z2, 0.8)
+
+        self.assertTrue(torch.equal(h0, z0))
+        self.assertTrue(torch.allclose(h1, 0.8 * z0 + 0.2 * z1))
+        self.assertTrue(
+            torch.allclose(h2, 0.64 * z0 + 0.16 * z1 + 0.2 * z2)
+        )
+
+    def test_memory_mode_uses_normalized_local_state_and_resets_each_forward(self):
+        core = RecordingONN(384)
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            feedback_memory_enabled=True,
+            feedback_memory_alpha=0.8,
+            onn_core=core,
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        first = predictor(context, None, masks_ctxt, masks_tgt)
+        first_states = list(core.feedback_states)
+        first_normalized = list(core.normalized_outputs)
+        core.feedback_values.clear()
+        core.feedback_states.clear()
+        core.outputs.clear()
+        core.normalized_outputs.clear()
+        second = predictor(
+            context,
+            None,
+            masks_ctxt,
+            masks_tgt,
+            mask_index=1,
+        )
+
+        self.assertTrue(torch.equal(first, second))
+        self.assertEqual(
+            [state is not None for state in first_states],
+            [False, True, True, True, True, True, True, True],
+        )
+        self.assertIs(first_states[1], first_normalized[0])
+        expected_h1 = 0.8 * first_normalized[0] + 0.2 * first_normalized[1]
+        self.assertTrue(torch.allclose(first_states[2], expected_h1))
+        self.assertIsNone(core.feedback_states[0])
+        self.assertTrue(torch.equal(core.feedback_states[1], first_states[1]))
+        self.assertNotIn("memory_state", predictor.__dict__)
+        self.assertFalse(
+            any("memory_state" in name for name in predictor.state_dict())
+        )
+        self.assertFalse(
+            any("memory_alpha" in name for name in predictor.state_dict())
+        )
+        self.assertFalse(
+            any("memory_alpha" in name for name, _ in predictor.named_parameters())
+        )
+
+    def test_memory_alpha_zero_matches_immediate_previous_output_mode(self):
+        torch.manual_seed(23)
+        baseline_core = RecordingONN(384)
+        baseline = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            feedback_memory_enabled=False,
+            onn_core=baseline_core,
+        )
+        memory_core = RecordingONN(384)
+        memory = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            feedback_memory_enabled=True,
+            feedback_memory_alpha=0.0,
+            onn_core=memory_core,
+        )
+        memory.load_state_dict(baseline.state_dict())
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        baseline_output = baseline(context, None, masks_ctxt, masks_tgt)
+        memory_output = memory(context, None, masks_ctxt, masks_tgt)
+
+        self.assertTrue(torch.equal(baseline_output, memory_output))
+        self.assertEqual(
+            [value is not None for value in baseline_core.feedback_values],
+            [False, True, True, True, True, True, True, True],
+        )
+        self.assertEqual(
+            [value is not None for value in memory_core.feedback_states],
+            [False, True, True, True, True, True, True, True],
+        )
+
+    def test_fsonn_rejects_raw_feedback_and_normalized_state_together(self):
+        model = FeedbackFSONN(small_onn_config())
+        slot = torch.randn(1, 2, 2)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            model(
+                slot,
+                feedback=slot,
+                feedback_state=slot,
+            )
+
+    def test_normalized_feedback_state_is_not_layer_normalized_twice(self):
+        model = FeedbackFSONN(small_onn_config())
+        state = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]])
+        expected = model.config.feedback_phase_max_rad * torch.tanh(
+            model._effective_feedback_gains() * state
+        )
+
+        actual = model._feedback_state_to_phases(state)
+
+        self.assertTrue(torch.allclose(actual[2], expected))
+        self.assertFalse(
+            torch.allclose(actual[2], model._feedback_to_phases(state)[2])
+        )
+
+    def test_memory_feedback_preserves_cross_chunk_gradients_and_slm_parameters(self):
+        torch.manual_seed(31)
+        config = small_onn_config(
+            feedback_memory_enabled=True,
+            feedback_memory_alpha=0.8,
+        )
+        model = FeedbackFSONN(config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        x0 = torch.randn(1, 2, 2, requires_grad=True)
+        x1 = torch.randn(1, 2, 2, requires_grad=True)
+        phase_before = [
+            layer.phase_logits.detach().clone() for layer in model.slm_layers
+        ]
+
+        y0 = model(x0)
+        h0 = model.normalize_feedback_output(y0)
+        y1 = model(x1, feedback_state=h0)
+        loss = y1.square().mean()
+        loss.backward()
+
+        self.assertIsNotNone(x0.grad)
+        self.assertTrue(torch.isfinite(x0.grad).all())
+        self.assertGreater(x0.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(model.feedback_gain_raw.grad)
+        self.assertTrue(torch.isfinite(model.feedback_gain_raw.grad).all())
+        self.assertGreater(model.feedback_gain_raw.grad.abs().sum().item(), 0.0)
+        for layer, before in zip(model.slm_layers, phase_before):
+            self.assertTrue(torch.equal(layer.phase_logits.detach(), before))
+            self.assertIsNotNone(layer.phase_logits.grad)
+            self.assertTrue(torch.isfinite(layer.phase_logits.grad).all())
+
+        optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            eval_output = model(x1.detach(), feedback_state=h0.detach())
+        self.assertTrue(torch.isfinite(eval_output).all())
+
+    def test_memory_state_is_shared_across_multilayer_gate_modes(self):
+        state = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]])
+        for gain_mode, gain_init in (
+            ("shared", 1.0),
+            ("independent", [0.5, 1.5, 3.0]),
+        ):
+            with self.subTest(gain_mode=gain_mode):
+                model = FeedbackFSONN(
+                    small_multi_onn_config(gain_mode, gain_init=gain_init)
+                )
+                phases = model._feedback_state_to_phases(state)
+                self.assertEqual(tuple(phases), (2, 3, 4))
+                if gain_mode == "shared":
+                    self.assertTrue(torch.equal(phases[2], phases[3]))
+                    self.assertTrue(torch.equal(phases[3], phases[4]))
+                else:
+                    self.assertFalse(torch.equal(phases[2], phases[3]))
+                    self.assertFalse(torch.equal(phases[3], phases[4]))
 
     def test_overlapping_masks_are_rejected(self):
         predictor = self.make_predictor()

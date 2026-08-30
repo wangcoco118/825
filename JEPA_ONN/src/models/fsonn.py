@@ -30,6 +30,8 @@ class ONNConfig:
     feedback_phase_max_rad: float = 1.5707963267948966
     feedback_gain_init: Union[float, Tuple[float, ...]] = 1.0
     feedback_gain_epsilon: float = 1.0e-6
+    feedback_memory_enabled: bool = False
+    feedback_memory_alpha: float = 0.8
     readout_mode: str = "intensity_minus_learnable_offset"
     input_encoding_mode: str = "signed_phase"
     pixel_pitch_um: float = 8.0
@@ -113,6 +115,12 @@ class ONNConfig:
             raise ValueError("feedback_phase_max_rad must be positive")
         if self.feedback_gain_epsilon <= 0:
             raise ValueError("feedback_gain_epsilon must be positive")
+        if not 0.0 <= float(self.feedback_memory_alpha) < 1.0:
+            raise ValueError("feedback_memory_alpha must satisfy 0 <= alpha < 1")
+        if self.feedback_memory_enabled and not self.feedback_enabled:
+            raise ValueError(
+                "feedback_memory_enabled cannot be true when feedback is disabled"
+            )
         if self.readout_mode != "intensity_minus_learnable_offset":
             raise ValueError("only intensity_minus_learnable_offset is supported")
         if self.input_encoding_mode != "signed_phase":
@@ -249,26 +257,36 @@ class FeedbackFSONN(nn.Module):
     def _effective_feedback_gains(self) -> torch.Tensor:
         return F.softplus(self.feedback_gain_raw) + self.config.feedback_gain_epsilon
 
-    def _feedback_to_phases(
+    def normalize_feedback_output(self, output: torch.Tensor) -> torch.Tensor:
+        return self.feedback_norm(output)
+
+    def _feedback_state_to_phases(
         self,
-        feedback: torch.Tensor,
+        feedback_state: torch.Tensor,
     ) -> Dict[int, torch.Tensor]:
         if not self.config.feedback_enabled:
             return {}
-        normalized = self.feedback_norm(feedback)
         gains = self._effective_feedback_gains()
         indices = self.config.active_feedback_layer_indices
         if self.config.feedback_layer_mode == "single" or self.config.feedback_gain_mode == "shared":
             shared_phase = self.config.feedback_phase_max_rad * torch.tanh(
-                gains * normalized
+                gains * feedback_state
             )
             return {index: shared_phase for index in indices}
         return {
             index: self.config.feedback_phase_max_rad * torch.tanh(
-                gains[position] * normalized
+                gains[position] * feedback_state
             )
             for position, index in enumerate(indices)
         }
+
+    def _feedback_to_phases(
+        self,
+        feedback: torch.Tensor,
+    ) -> Dict[int, torch.Tensor]:
+        return self._feedback_state_to_phases(
+            self.normalize_feedback_output(feedback)
+        )
 
     def _feedback_to_phase(self, feedback: torch.Tensor) -> torch.Tensor:
         phases = self._feedback_to_phases(feedback)
@@ -322,6 +340,7 @@ class FeedbackFSONN(nn.Module):
         self,
         slot: torch.Tensor,
         feedback: Optional[torch.Tensor] = None,
+        feedback_state: Optional[torch.Tensor] = None,
         feedback_layer_index: Optional[int] = None,
         feedback_layer_indices: Optional[Sequence[int]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -337,11 +356,21 @@ class FeedbackFSONN(nn.Module):
             feedback_layer_indices,
             feedback_layer_index,
         )
+        if feedback is not None and feedback_state is not None:
+            raise ValueError(
+                "feedback and feedback_state are mutually exclusive"
+            )
         feedback_phases = {}
         if feedback is not None:
             if feedback.shape != slot.shape:
                 raise ValueError("feedback must match the current slot shape")
             feedback_phases = self._feedback_to_phases(feedback)
+        elif feedback_state is not None:
+            if feedback_state.shape != slot.shape:
+                raise ValueError(
+                    "feedback_state must match the current slot shape"
+                )
+            feedback_phases = self._feedback_state_to_phases(feedback_state)
         feedback_phase = (
             next(iter(feedback_phases.values()))
             if len(feedback_phases) == 1
@@ -367,7 +396,15 @@ class FeedbackFSONN(nn.Module):
             "feedback_layer_indices": selected_indices,
             "feedback_layer_mode": self.config.feedback_layer_mode,
             "feedback_gain_mode": self.config.feedback_gain_mode,
-            "feedback_used": feedback is not None and bool(feedback_phases),
+            "feedback_used": (
+                (feedback is not None or feedback_state is not None)
+                and bool(feedback_phases)
+            ),
+            "feedback_source_kind": (
+                "normalized_memory"
+                if feedback_state is not None
+                else ("previous_output" if feedback is not None else None)
+            ),
         }
         for layer_index, slm in enumerate(self.slm_layers):
             field = slm(field, phase_delta=feedback_phases.get(layer_index))
@@ -401,6 +438,7 @@ class FeedbackFSONN(nn.Module):
         x: torch.Tensor,
         return_debug: bool = False,
         feedback: Optional[torch.Tensor] = None,
+        feedback_state: Optional[torch.Tensor] = None,
         feedback_layer_index: Optional[int] = None,
         feedback_layer_indices: Optional[Sequence[int]] = None,
     ):
@@ -415,6 +453,7 @@ class FeedbackFSONN(nn.Module):
             output, debug = self._propagate_slot(
                 slot,
                 feedback=feedback,
+                feedback_state=feedback_state,
                 feedback_layer_index=feedback_layer_index,
                 feedback_layer_indices=feedback_layer_indices,
             )

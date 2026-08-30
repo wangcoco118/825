@@ -58,6 +58,9 @@ onn:
   output_dim: 384
   num_slm_layers: 5
   feedback_mode: fixed_middle_phase
+  feedback_enabled: true
+  feedback_memory_enabled: true
+  feedback_memory_alpha: 0.8
   feedback_layer_index: 1
   feedback_phase_max_rad: 1.5707963267948966
   feedback_gain_init: 1.0

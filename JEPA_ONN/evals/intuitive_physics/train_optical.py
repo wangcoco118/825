@@ -97,6 +97,15 @@ def _feedback_runtime_metadata(predictor):
         "feedback_layer_mode": config.feedback_layer_mode,
         "feedback_phase_max_rad": float(config.feedback_phase_max_rad),
         "feedback_gain_epsilon": float(config.feedback_gain_epsilon),
+        "feedback_memory_enabled": bool(config.feedback_memory_enabled),
+        "feedback_memory_alpha": float(config.feedback_memory_alpha),
+        "feedback_memory_update": (
+            "H0=Z0; "
+            f"Ht={config.feedback_memory_alpha:g}*Hprev+"
+            f"{1.0 - config.feedback_memory_alpha:g}*Zt"
+            if config.feedback_memory_enabled
+            else "disabled; use immediate previous output"
+        ),
         "effective_feedback_gains": [float(value) for value in gains],
         "feedback_gain_parameter_count": int(gain_parameter.numel()),
         "physical_feedback_layers": [index + 1 for index in layer_indices],
@@ -131,7 +140,16 @@ def _format_feedback_metadata(metadata):
             f"physical_feedback_layers={metadata['physical_feedback_layers']}",
             f"feedback_phase_max_rad={metadata['feedback_phase_max_rad']:.12g}",
             f"feedback_gain_parameter_count={metadata['feedback_gain_parameter_count']}",
+            "feedback_memory_enabled="
+            f"{str(metadata['feedback_memory_enabled']).lower()}",
         ]
+    )
+    if metadata["feedback_memory_enabled"]:
+        parts.append(
+            f"feedback_memory_alpha={metadata['feedback_memory_alpha']:g}"
+        )
+    parts.append(
+        f"feedback_memory_update={metadata['feedback_memory_update']}"
     )
     gains = metadata["effective_feedback_gains"]
     if len(gains) == 1:

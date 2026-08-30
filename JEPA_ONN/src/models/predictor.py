@@ -409,6 +409,8 @@ class ONNFeedbackPredictor(nn.Module):
         feedback_layer_index=None,
         feedback_layer_indices=None,
         feedback_gain_mode=None,
+        feedback_memory_enabled=None,
+        feedback_memory_alpha=None,
         uniform_power=False,
         optical_config=None,
         onn_core=None,
@@ -477,6 +479,10 @@ class ONNFeedbackPredictor(nn.Module):
                 config_values["feedback_layer_indices"] = feedback_layer_indices
             if feedback_gain_mode is not None:
                 config_values["feedback_gain_mode"] = feedback_gain_mode
+            if feedback_memory_enabled is not None:
+                config_values["feedback_memory_enabled"] = feedback_memory_enabled
+            if feedback_memory_alpha is not None:
+                config_values["feedback_memory_alpha"] = feedback_memory_alpha
             onn_config = ONNConfig.from_mapping(config_values)
             onn_core = FeedbackFSONN(onn_config)
         self.onn_core = onn_core
@@ -487,6 +493,8 @@ class ONNFeedbackPredictor(nn.Module):
             resolved_layer_index = core_config.feedback_layer_index
             resolved_layer_indices = core_config.feedback_layer_indices
             resolved_gain_mode = core_config.feedback_gain_mode
+            resolved_memory_enabled = core_config.feedback_memory_enabled
+            resolved_memory_alpha = core_config.feedback_memory_alpha
             explicit_values = (
                 ("feedback_layer_mode", feedback_layer_mode, resolved_layer_mode),
                 ("feedback_layer_index", feedback_layer_index, resolved_layer_index),
@@ -496,6 +504,16 @@ class ONNFeedbackPredictor(nn.Module):
                     resolved_layer_indices,
                 ),
                 ("feedback_gain_mode", feedback_gain_mode, resolved_gain_mode),
+                (
+                    "feedback_memory_enabled",
+                    feedback_memory_enabled,
+                    resolved_memory_enabled,
+                ),
+                (
+                    "feedback_memory_alpha",
+                    feedback_memory_alpha,
+                    resolved_memory_alpha,
+                ),
             )
             for name, explicit, resolved in explicit_values:
                 if explicit is not None and explicit != resolved:
@@ -544,6 +562,20 @@ class ONNFeedbackPredictor(nn.Module):
                 resolved_gain_mode = feedback_gain_mode
             else:
                 raise ValueError("feedback_layer_mode must be 'single' or 'multi'")
+            resolved_memory_enabled = (
+                False
+                if feedback_memory_enabled is None
+                else bool(feedback_memory_enabled)
+            )
+            resolved_memory_alpha = (
+                0.8
+                if feedback_memory_alpha is None
+                else float(feedback_memory_alpha)
+            )
+            if not 0.0 <= resolved_memory_alpha < 1.0:
+                raise ValueError(
+                    "feedback_memory_alpha must satisfy 0 <= alpha < 1"
+                )
 
         self.feedback_layer_mode = resolved_layer_mode
         self.feedback_layer_index = (
@@ -555,6 +587,14 @@ class ONNFeedbackPredictor(nn.Module):
             else tuple(int(index) for index in resolved_layer_indices)
         )
         self.feedback_gain_mode = resolved_gain_mode
+        self.feedback_memory_enabled = bool(resolved_memory_enabled)
+        self.feedback_memory_alpha = float(resolved_memory_alpha)
+        if self.feedback_memory_enabled and not callable(
+            getattr(self.onn_core, "normalize_feedback_output", None)
+        ):
+            raise TypeError(
+                "memory-enabled ONN core must provide normalize_feedback_output"
+            )
         slm_layers = getattr(self.onn_core, "slm_layers", ())
         if slm_layers:
             selected = (
@@ -567,6 +607,12 @@ class ONNFeedbackPredictor(nn.Module):
                     "feedback layers must identify existing SLM layers"
                 )
         self.last_trace = {}
+
+    @staticmethod
+    def _update_feedback_memory(memory_state, normalized_output, alpha):
+        if memory_state is None:
+            return normalized_output
+        return alpha * memory_state + (1.0 - alpha) * normalized_output
 
     def _init_pos_embed(
         self,
@@ -668,6 +714,7 @@ class ONNFeedbackPredictor(nn.Module):
         )
 
         previous_output = None
+        memory_state = None
         outputs = []
         for chunk_index in range(self.num_chunks):
             x_chunk = chunks[:, chunk_index]
@@ -676,11 +723,19 @@ class ONNFeedbackPredictor(nn.Module):
                 if self.feedback_layer_mode == "single"
                 else {"feedback_layer_indices": self.feedback_layer_indices}
             )
-            result = self.onn_core(
-                x_chunk,
-                feedback=previous_output,
-                **feedback_kwargs,
-            )
+            if self.feedback_memory_enabled:
+                result = self.onn_core(
+                    x_chunk,
+                    feedback=None,
+                    feedback_state=memory_state,
+                    **feedback_kwargs,
+                )
+            else:
+                result = self.onn_core(
+                    x_chunk,
+                    feedback=previous_output,
+                    **feedback_kwargs,
+                )
             if isinstance(result, (tuple, list)):
                 y_chunk, feedback_source = result
             else:
@@ -697,7 +752,17 @@ class ONNFeedbackPredictor(nn.Module):
                     "ONN feedback source must match the current chunk shape"
                 )
             outputs.append(y_chunk)
-            previous_output = feedback_source
+            if self.feedback_memory_enabled:
+                normalized_output = self.onn_core.normalize_feedback_output(
+                    feedback_source
+                )
+                memory_state = self._update_feedback_memory(
+                    memory_state,
+                    normalized_output,
+                    self.feedback_memory_alpha,
+                )
+            else:
+                previous_output = feedback_source
 
         dense_output = torch.cat(outputs, dim=1)
         dense_output = self.predictor_norm(dense_output)
@@ -733,6 +798,8 @@ class ONNFeedbackPredictor(nn.Module):
             "feedback_layer_index": self.feedback_layer_index,
             "feedback_layer_indices": self.feedback_layer_indices,
             "feedback_gain_mode": self.feedback_gain_mode,
+            "feedback_memory_enabled": self.feedback_memory_enabled,
+            "feedback_memory_alpha": self.feedback_memory_alpha,
             "feedback_mode": self.feedback_mode,
         }
         return pred_tgt_1024
