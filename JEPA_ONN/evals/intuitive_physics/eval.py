@@ -44,11 +44,7 @@ from src.models.fsonn import OpticalQKVConfig
 from src.models.optical_distillation import load_optical_checkpoint
 from evals.intuitive_physics.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
-from src.masks.multiblock3d import (
-    MaskCollator as MB3DMaskCollator,
-    make_mask_collator,
-    normalize_mask_mode,
-)
+from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
 from src.masks.causal import MaskCollator as CausalMaskCollator
 from src.utils.distributed import (
     init_distributed,
@@ -351,9 +347,7 @@ def main(args_eval, resume_preempt=False):
                     patch_size=patch_size,
                     resolution=resolution,
                     normalize_targets=normalize_targets,
-                    progress_log=progress_log,
-                    mask_mode=args_eval.get("mask_mode"),
-                    mask_config=args_eval.get("mask"))
+                    progress_log=progress_log)
 
                 all_losses = batch_all_gather(all_losses).cpu()
                 all_labels = batch_all_gather(all_labels).cpu()
@@ -649,9 +643,7 @@ def extract_losses(
     patch_size=16,
     resolution=224,
     normalize_targets=True,
-    progress_log=None,
-    mask_mode=None,
-    mask_config=None,
+    progress_log=None
 ):
     if progress_log is None:
         progress_log = SynchronizedProgressLog(
@@ -663,9 +655,6 @@ def extract_losses(
         close_progress_log = False
 
     progress_log.log(f"CONTEXT_LENGTHS values={context_lengths}")
-    if mask_mode is not None:
-        mask_mode = normalize_mask_mode(mask_mode)
-        progress_log.log(f"MASK_MODE mode={mask_mode}")
 
     sampling_rate, num_frames = frame_step, 99 // frame_step
 
@@ -699,16 +688,6 @@ def extract_losses(
 
     loader = iter(data)
     total_batches = len(data)
-    mask_collator = None
-    if mask_mode is not None and not is_mae:
-        mask_collator = make_mask_collator(
-            mask_mode=mask_mode,
-            cfgs_mask=mask_config,
-            crop_size=(resolution, resolution),
-            num_frames=frames_per_clip,
-            patch_size=(patch_size, patch_size),
-            tubelet_size=2,
-        )
     extract_start = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -754,16 +733,10 @@ def extract_losses(
         all_losses_ctxt = []
         for CTXT_LEN in context_lengths:
 
-            if mask_collator is None:
-                m,m_,full_m = get_time_masks(CTXT_LEN,spatial_size=(patch_size,patch_size),temporal_dim=frames_per_clip,as_bool=is_mae)
-                full_m = full_m.unsqueeze(0).to(device)
-                m = m.unsqueeze(0).to(device)
-                m_ = m_.unsqueeze(0).to(device)
-            else:
-                random_masks_ctxt, random_masks_tgt = mask_collator.generate_masks(B)
-                m = random_masks_ctxt[0].to(device=device, dtype=torch.long)
-                m_ = random_masks_tgt[0].to(device=device, dtype=torch.long)
-                full_m = torch.arange(1568, device=device, dtype=torch.long).unsqueeze(0).repeat(B, 1)
+            m,m_,full_m = get_time_masks(CTXT_LEN,spatial_size=(patch_size,patch_size),temporal_dim=frames_per_clip,as_bool=is_mae)
+            full_m = full_m.unsqueeze(0).to(device)
+            m = m.unsqueeze(0).to(device)
+            m_ = m_.unsqueeze(0).to(device)
 
             if is_mae:
                 masks_enc = m.repeat(B, 1)

@@ -56,9 +56,9 @@ predictor:
 onn:
   input_dim: 384
   output_dim: 384
-  num_slm_layers: 4
+  num_slm_layers: 5
   feedback_mode: fixed_middle_phase
-  feedback_layer_index: 2
+  feedback_layer_index: 1
   feedback_phase_max_rad: 1.5707963267948966
   feedback_gain_init: 1.0
   readout_mode: intensity_minus_learnable_offset
@@ -66,7 +66,7 @@ onn:
   use_differential_detector: false
   pixel_pitch_um: 8.0
   wavelength_nm: 532.0
-  slm_intervals_um: [25000.0, 25000.0, 25000.0]
+  slm_intervals_um: [25000.0, 25000.0, 25000.0, 25000.0]
   input_to_first_slm_um: 50000.0
   last_slm_to_detector_um: 50000.0
   asm_padding_factor: 2.0

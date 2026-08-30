@@ -79,6 +79,70 @@ def _unwrap_module(module):
     return module.module if isinstance(module, DistributedDataParallel) else module
 
 
+def _feedback_runtime_metadata(predictor):
+    predictor_model = _unwrap_module(predictor)
+    if hasattr(predictor_model, "backbone"):
+        predictor_model = predictor_model.backbone
+    onn_core = getattr(predictor_model, "onn_core", None)
+    config = getattr(onn_core, "config", None)
+    gain_parameter = getattr(onn_core, "feedback_gain_raw", None)
+    gain_reader = getattr(onn_core, "_effective_feedback_gains", None)
+    if config is None or gain_parameter is None or gain_reader is None:
+        return {}
+    layer_indices = list(config.active_feedback_layer_indices)
+    gains = gain_reader().detach().cpu().reshape(-1).tolist()
+    metadata = {
+        "feedback_enabled": bool(config.feedback_enabled),
+        "feedback_mode": config.feedback_mode,
+        "feedback_layer_mode": config.feedback_layer_mode,
+        "feedback_phase_max_rad": float(config.feedback_phase_max_rad),
+        "feedback_gain_epsilon": float(config.feedback_gain_epsilon),
+        "effective_feedback_gains": [float(value) for value in gains],
+        "feedback_gain_parameter_count": int(gain_parameter.numel()),
+        "physical_feedback_layers": [index + 1 for index in layer_indices],
+    }
+    if config.feedback_layer_mode == "single":
+        metadata["feedback_layer_index"] = int(config.feedback_layer_index)
+    else:
+        metadata["feedback_layer_indices"] = layer_indices
+        metadata["feedback_gain_mode"] = config.feedback_gain_mode
+    return metadata
+
+
+def _format_feedback_metadata(metadata):
+    if not metadata:
+        return ""
+    parts = [
+        f"feedback_enabled={metadata['feedback_enabled']}",
+        f"feedback_mode={metadata['feedback_mode']}",
+        f"feedback_layer_mode={metadata['feedback_layer_mode']}",
+    ]
+    if metadata["feedback_layer_mode"] == "single":
+        parts.append(f"feedback_layer_index={metadata['feedback_layer_index']}")
+    else:
+        parts.extend(
+            [
+                f"feedback_layer_indices={metadata['feedback_layer_indices']}",
+                f"feedback_gain_mode={metadata['feedback_gain_mode']}",
+            ]
+        )
+    parts.extend(
+        [
+            f"physical_feedback_layers={metadata['physical_feedback_layers']}",
+            f"feedback_phase_max_rad={metadata['feedback_phase_max_rad']:.12g}",
+            f"feedback_gain_parameter_count={metadata['feedback_gain_parameter_count']}",
+        ]
+    )
+    gains = metadata["effective_feedback_gains"]
+    if len(gains) == 1:
+        gains = gains * len(metadata["physical_feedback_layers"])
+    parts.extend(
+        f"SLM{layer}_K={gain:.6f}"
+        for layer, gain in zip(metadata["physical_feedback_layers"], gains)
+    )
+    return " ".join(parts)
+
+
 def _distributed_worker(rank, config, args, outputs, gpu_ids):
     world_size = len(gpu_ids)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -1150,7 +1214,7 @@ def _end_to_end_checkpoint(
     }.get(experiment_mode)
     if checkpoint_mode is None:
         raise ValueError(f"unsupported checkpoint experiment mode: {experiment_mode}")
-    return {
+    checkpoint = {
         "format_version": 1,
         "mode": checkpoint_mode,
         "experiment_mode": experiment_mode,
@@ -1174,8 +1238,6 @@ def _end_to_end_checkpoint(
         "chunk_tokens": 196,
         "predictor_dim": 384,
         "output_dim": 1024,
-        "feedback_mode": "fixed_middle",
-        "feedback_layer_index": 2,
         "readout_mode": "intensity_minus_learnable_offset",
         "differential_detector": False,
         "world_size": int(world_size),
@@ -1203,6 +1265,8 @@ def _end_to_end_checkpoint(
         "data_split": copy.deepcopy(split),
         "split_manifest": os.path.abspath(split_manifest),
     }
+    checkpoint.update(_feedback_runtime_metadata(predictor))
+    return checkpoint
 
 
 def _load_end_to_end_checkpoint(
@@ -1600,6 +1664,13 @@ def run_end_to_end_jepa(
         )
     _sync_for_timing(device)
     logger.info("model_prepare_done elapsed_s=%.3f", time.perf_counter() - model_started)
+    if int(rank) == 0:
+        feedback_metadata = _feedback_runtime_metadata(predictor)
+        if feedback_metadata:
+            logger.info(
+                "feedback_init %s",
+                _format_feedback_metadata(feedback_metadata),
+            )
     trainable = [
         parameter for parameter in predictor.parameters()
         if parameter.requires_grad
@@ -1808,6 +1879,14 @@ def run_end_to_end_jepa(
             _save_checkpoint(last_checkpoint, last_output)
         if world_size > 1:
             dist.barrier()
+        if int(rank) == 0:
+            feedback_metadata = _feedback_runtime_metadata(predictor)
+            if feedback_metadata:
+                logger.info(
+                    "feedback_epoch epoch=%d %s",
+                    epoch,
+                    _format_feedback_metadata(feedback_metadata),
+                )
         logger.info(
             "epoch_done experiment_mode=%s epoch=%d train_jepa_loss=%.6f "
             "val_jepa_loss=%.6f best_val_jepa_loss=%.6f improved=%s "

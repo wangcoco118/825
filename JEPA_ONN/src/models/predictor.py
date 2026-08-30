@@ -405,7 +405,10 @@ class ONNFeedbackPredictor(nn.Module):
         chunk_tokens=196,
         output_mlp_hidden_dim=384,
         feedback_mode="fixed_middle_phase",
+        feedback_layer_mode=None,
         feedback_layer_index=None,
+        feedback_layer_indices=None,
+        feedback_gain_mode=None,
         uniform_power=False,
         optical_config=None,
         onn_core=None,
@@ -466,16 +469,103 @@ class ONNFeedbackPredictor(nn.Module):
                     "learnable_intensity_offset": True,
                 }
             )
+            if feedback_layer_mode is not None:
+                config_values["feedback_layer_mode"] = feedback_layer_mode
+            if feedback_layer_index is not None:
+                config_values["feedback_layer_index"] = feedback_layer_index
+            if feedback_layer_indices is not None:
+                config_values["feedback_layer_indices"] = feedback_layer_indices
+            if feedback_gain_mode is not None:
+                config_values["feedback_gain_mode"] = feedback_gain_mode
             onn_config = ONNConfig.from_mapping(config_values)
             onn_core = FeedbackFSONN(onn_config)
         self.onn_core = onn_core
 
-        if feedback_layer_index is None:
-            feedback_layer_index = 2
-        self.feedback_layer_index = int(feedback_layer_index)
+        core_config = getattr(self.onn_core, "config", None)
+        if isinstance(core_config, ONNConfig):
+            resolved_layer_mode = core_config.feedback_layer_mode
+            resolved_layer_index = core_config.feedback_layer_index
+            resolved_layer_indices = core_config.feedback_layer_indices
+            resolved_gain_mode = core_config.feedback_gain_mode
+            explicit_values = (
+                ("feedback_layer_mode", feedback_layer_mode, resolved_layer_mode),
+                ("feedback_layer_index", feedback_layer_index, resolved_layer_index),
+                (
+                    "feedback_layer_indices",
+                    None if feedback_layer_indices is None else tuple(feedback_layer_indices),
+                    resolved_layer_indices,
+                ),
+                ("feedback_gain_mode", feedback_gain_mode, resolved_gain_mode),
+            )
+            for name, explicit, resolved in explicit_values:
+                if explicit is not None and explicit != resolved:
+                    raise ValueError(f"{name} must match the resolved ONNConfig")
+        else:
+            if feedback_layer_index is not None and feedback_layer_indices is not None:
+                raise ValueError(
+                    "feedback_layer_index and feedback_layer_indices are mutually exclusive"
+                )
+            resolved_layer_mode = feedback_layer_mode
+            if resolved_layer_mode is None:
+                resolved_layer_mode = (
+                    "multi" if feedback_layer_indices is not None else "single"
+                )
+            if resolved_layer_mode == "single":
+                if feedback_layer_indices is not None or feedback_gain_mode is not None:
+                    raise ValueError(
+                        "single feedback cannot define plural layers or gain mode"
+                    )
+                resolved_layer_index = (
+                    2 if feedback_layer_index is None else int(feedback_layer_index)
+                )
+                resolved_layer_indices = None
+                resolved_gain_mode = None
+            elif resolved_layer_mode == "multi":
+                if feedback_layer_index is not None:
+                    raise ValueError(
+                        "multi feedback cannot define feedback_layer_index"
+                    )
+                if feedback_layer_indices is None or len(feedback_layer_indices) < 2:
+                    raise ValueError(
+                        "multi feedback requires at least two feedback_layer_indices"
+                    )
+                resolved_layer_index = None
+                resolved_layer_indices = tuple(
+                    int(index) for index in feedback_layer_indices
+                )
+                if tuple(sorted(set(resolved_layer_indices))) != resolved_layer_indices:
+                    raise ValueError(
+                        "feedback_layer_indices must be unique and strictly increasing"
+                    )
+                if feedback_gain_mode not in {"shared", "independent"}:
+                    raise ValueError(
+                        "multi feedback_gain_mode must be 'shared' or 'independent'"
+                    )
+                resolved_gain_mode = feedback_gain_mode
+            else:
+                raise ValueError("feedback_layer_mode must be 'single' or 'multi'")
+
+        self.feedback_layer_mode = resolved_layer_mode
+        self.feedback_layer_index = (
+            None if resolved_layer_index is None else int(resolved_layer_index)
+        )
+        self.feedback_layer_indices = (
+            None
+            if resolved_layer_indices is None
+            else tuple(int(index) for index in resolved_layer_indices)
+        )
+        self.feedback_gain_mode = resolved_gain_mode
         slm_layers = getattr(self.onn_core, "slm_layers", ())
-        if slm_layers and not 0 <= self.feedback_layer_index < len(slm_layers):
-            raise ValueError("feedback_layer_index must identify an existing SLM layer")
+        if slm_layers:
+            selected = (
+                (self.feedback_layer_index,)
+                if self.feedback_layer_mode == "single"
+                else self.feedback_layer_indices
+            )
+            if any(not 0 <= index < len(slm_layers) for index in selected):
+                raise ValueError(
+                    "feedback layers must identify existing SLM layers"
+                )
         self.last_trace = {}
 
     def _init_pos_embed(
@@ -581,10 +671,15 @@ class ONNFeedbackPredictor(nn.Module):
         outputs = []
         for chunk_index in range(self.num_chunks):
             x_chunk = chunks[:, chunk_index]
+            feedback_kwargs = (
+                {"feedback_layer_index": self.feedback_layer_index}
+                if self.feedback_layer_mode == "single"
+                else {"feedback_layer_indices": self.feedback_layer_indices}
+            )
             result = self.onn_core(
                 x_chunk,
                 feedback=previous_output,
-                feedback_layer_index=self.feedback_layer_index,
+                **feedback_kwargs,
             )
             if isinstance(result, (tuple, list)):
                 y_chunk, feedback_source = result
@@ -634,7 +729,10 @@ class ONNFeedbackPredictor(nn.Module):
             ),
             "current_chunk": self.num_chunks,
             "num_chunks": self.num_chunks,
+            "feedback_layer_mode": self.feedback_layer_mode,
             "feedback_layer_index": self.feedback_layer_index,
+            "feedback_layer_indices": self.feedback_layer_indices,
+            "feedback_gain_mode": self.feedback_gain_mode,
             "feedback_mode": self.feedback_mode,
         }
         return pred_tgt_1024

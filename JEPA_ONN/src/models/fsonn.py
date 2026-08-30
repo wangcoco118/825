@@ -1,7 +1,7 @@
 """Differentiable single-wavelength free-space optical QKV projection."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -22,9 +22,14 @@ class ONNConfig:
     grid_height: int = 196
     grid_width: int = 384
     feedback_mode: str = "fixed_middle_phase"
-    feedback_layer_index: int = 2
+    feedback_enabled: bool = True
+    feedback_layer_mode: Optional[str] = None
+    feedback_layer_index: Optional[int] = None
+    feedback_layer_indices: Optional[Tuple[int, ...]] = None
+    feedback_gain_mode: Optional[str] = None
     feedback_phase_max_rad: float = 1.5707963267948966
-    feedback_gain_init: float = 1.0
+    feedback_gain_init: Union[float, Tuple[float, ...]] = 1.0
+    feedback_gain_epsilon: float = 1.0e-6
     readout_mode: str = "intensity_minus_learnable_offset"
     input_encoding_mode: str = "signed_phase"
     pixel_pitch_um: float = 8.0
@@ -40,6 +45,10 @@ class ONNConfig:
     @classmethod
     def from_mapping(cls, values):
         values = dict(values or {})
+        if "feedback_layer_index" in values and "feedback_layer_indices" in values:
+            raise ValueError(
+                "feedback_layer_index and feedback_layer_indices are mutually exclusive"
+            )
         forbidden = {
             "positive_field",
             "negative_field",
@@ -67,6 +76,13 @@ class ONNConfig:
         normalized = {key: value for key, value in values.items() if key in allowed}
         if "slm_intervals_um" in normalized:
             normalized["slm_intervals_um"] = tuple(normalized["slm_intervals_um"])
+        if "feedback_layer_indices" in normalized:
+            normalized["feedback_layer_indices"] = tuple(
+                int(index) for index in normalized["feedback_layer_indices"]
+            )
+        gain_init = normalized.get("feedback_gain_init")
+        if isinstance(gain_init, (list, tuple)):
+            normalized["feedback_gain_init"] = tuple(float(value) for value in gain_init)
         return cls(**normalized)
 
     def __post_init__(self):
@@ -95,20 +111,102 @@ class ONNConfig:
             raise ValueError("only feedback_mode='fixed_middle_phase' is supported")
         if self.feedback_phase_max_rad <= 0:
             raise ValueError("feedback_phase_max_rad must be positive")
-        if self.feedback_gain_init <= 0:
-            raise ValueError("feedback_gain_init must be positive")
+        if self.feedback_gain_epsilon <= 0:
+            raise ValueError("feedback_gain_epsilon must be positive")
         if self.readout_mode != "intensity_minus_learnable_offset":
             raise ValueError("only intensity_minus_learnable_offset is supported")
         if self.input_encoding_mode != "signed_phase":
             raise ValueError("only signed_phase input encoding is supported")
-        if not 0 <= int(self.feedback_layer_index) < self.num_slm_layers:
-            raise ValueError("feedback_layer_index must identify an existing SLM layer")
+
+        layer_mode = self.feedback_layer_mode
+        if layer_mode is None:
+            if self.feedback_layer_indices is not None:
+                raise ValueError(
+                    "feedback_layer_indices requires feedback_layer_mode='multi'"
+                )
+            layer_mode = "single"
+            object.__setattr__(self, "feedback_layer_mode", layer_mode)
+            if self.feedback_layer_index is None:
+                object.__setattr__(self, "feedback_layer_index", 2)
+        if layer_mode not in {"single", "multi"}:
+            raise ValueError("feedback_layer_mode must be 'single' or 'multi'")
+
+        if layer_mode == "single":
+            if self.feedback_layer_index is None:
+                raise ValueError("single feedback requires feedback_layer_index")
+            if self.feedback_layer_indices is not None:
+                raise ValueError(
+                    "single feedback cannot define feedback_layer_indices"
+                )
+            if self.feedback_gain_mode is not None:
+                raise ValueError(
+                    "single feedback cannot define feedback_gain_mode"
+                )
+            if not 0 <= int(self.feedback_layer_index) < self.num_slm_layers:
+                raise ValueError(
+                    "feedback_layer_index must identify an existing SLM layer"
+                )
+        else:
+            if self.feedback_layer_index is not None:
+                raise ValueError(
+                    "multi feedback cannot define feedback_layer_index"
+                )
+            indices = self.feedback_layer_indices
+            if indices is None or len(indices) < 2:
+                raise ValueError(
+                    "multi feedback requires at least two feedback_layer_indices"
+                )
+            if tuple(sorted(set(indices))) != tuple(indices):
+                raise ValueError(
+                    "feedback_layer_indices must be unique and strictly increasing"
+                )
+            if any(not 0 <= int(index) < self.num_slm_layers for index in indices):
+                raise ValueError(
+                    "feedback_layer_indices must identify existing SLM layers"
+                )
+            if self.feedback_gain_mode not in {"shared", "independent"}:
+                raise ValueError(
+                    "multi feedback_gain_mode must be 'shared' or 'independent'"
+                )
+
+        gain_values = self.feedback_gain_initial_values()
+        if any(value <= self.feedback_gain_epsilon for value in gain_values):
+            raise ValueError(
+                "all effective feedback_gain_init values must exceed "
+                "feedback_gain_epsilon"
+            )
         if len(self.slm_intervals_um) != self.num_slm_layers - 1:
             raise ValueError("slm_intervals_um must contain one distance between each pair of SLMs")
         if any(distance <= 0 for distance in self.slm_intervals_um):
             raise ValueError("all SLM interval distances must be positive")
         if self.use_differential_detector:
             raise ValueError("differential detector is disabled for the feedback ONN")
+
+    @property
+    def active_feedback_layer_indices(self) -> Tuple[int, ...]:
+        if self.feedback_layer_mode == "single":
+            return (int(self.feedback_layer_index),)
+        return tuple(int(index) for index in self.feedback_layer_indices)
+
+    def feedback_gain_initial_values(self) -> Tuple[float, ...]:
+        gain_init = self.feedback_gain_init
+        is_sequence = isinstance(gain_init, tuple)
+        if self.feedback_layer_mode in {None, "single"}:
+            if is_sequence:
+                raise ValueError("single feedback_gain_init must be a scalar")
+            return (float(gain_init),)
+        if self.feedback_gain_mode == "shared":
+            if is_sequence:
+                raise ValueError("multi/shared feedback_gain_init must be a scalar")
+            return (float(gain_init),)
+        if is_sequence:
+            if len(gain_init) != len(self.feedback_layer_indices):
+                raise ValueError(
+                    "multi/independent feedback_gain_init length must match "
+                    "feedback_layer_indices"
+                )
+            return tuple(float(value) for value in gain_init)
+        return tuple(float(gain_init) for _ in self.feedback_layer_indices)
 
 
 class FeedbackFSONN(nn.Module):
@@ -128,13 +226,16 @@ class FeedbackFSONN(nn.Module):
             config.output_dim,
             elementwise_affine=False,
         )
-        initial_softplus = torch.tensor(
-            max(config.feedback_gain_init - config.eps, torch.finfo(torch.float32).tiny),
+        initial_gains = torch.tensor(
+            config.feedback_gain_initial_values(),
             dtype=torch.float32,
         )
+        initial_softplus = initial_gains - config.feedback_gain_epsilon
         feedback_gain_raw = initial_softplus + torch.log(
             -torch.expm1(-initial_softplus)
         )
+        if config.feedback_layer_mode == "single" or config.feedback_gain_mode == "shared":
+            feedback_gain_raw = feedback_gain_raw.squeeze(0)
         self.feedback_gain_raw = nn.Parameter(feedback_gain_raw)
         self.intensity_offset = (
             nn.Parameter(torch.zeros(1, 1, config.output_dim))
@@ -145,10 +246,57 @@ class FeedbackFSONN(nn.Module):
     def _positive_parameter(self, raw: torch.Tensor) -> torch.Tensor:
         return F.softplus(raw) + self.config.eps
 
-    def _feedback_to_phase(self, feedback: torch.Tensor) -> torch.Tensor:
+    def _effective_feedback_gains(self) -> torch.Tensor:
+        return F.softplus(self.feedback_gain_raw) + self.config.feedback_gain_epsilon
+
+    def _feedback_to_phases(
+        self,
+        feedback: torch.Tensor,
+    ) -> Dict[int, torch.Tensor]:
+        if not self.config.feedback_enabled:
+            return {}
         normalized = self.feedback_norm(feedback)
-        gain = self._positive_parameter(self.feedback_gain_raw)
-        return self.config.feedback_phase_max_rad * torch.tanh(gain * normalized)
+        gains = self._effective_feedback_gains()
+        indices = self.config.active_feedback_layer_indices
+        if self.config.feedback_layer_mode == "single" or self.config.feedback_gain_mode == "shared":
+            shared_phase = self.config.feedback_phase_max_rad * torch.tanh(
+                gains * normalized
+            )
+            return {index: shared_phase for index in indices}
+        return {
+            index: self.config.feedback_phase_max_rad * torch.tanh(
+                gains[position] * normalized
+            )
+            for position, index in enumerate(indices)
+        }
+
+    def _feedback_to_phase(self, feedback: torch.Tensor) -> torch.Tensor:
+        phases = self._feedback_to_phases(feedback)
+        if len(phases) != 1:
+            raise ValueError("_feedback_to_phase is only valid for single feedback")
+        return next(iter(phases.values()))
+
+    def _resolve_feedback_layer_indices(
+        self,
+        feedback_layer_indices: Optional[Sequence[int]],
+        feedback_layer_index: Optional[int],
+    ) -> Tuple[int, ...]:
+        if feedback_layer_indices is not None and feedback_layer_index is not None:
+            raise ValueError(
+                "feedback_layer_index and feedback_layer_indices are mutually exclusive"
+            )
+        configured = self.config.active_feedback_layer_indices
+        if feedback_layer_indices is not None:
+            requested = tuple(int(index) for index in feedback_layer_indices)
+        elif feedback_layer_index is not None:
+            requested = (int(feedback_layer_index),)
+        else:
+            requested = configured
+        if requested != configured:
+            raise ValueError(
+                "runtime feedback layer selection must match ONNConfig"
+            )
+        return configured
 
     def _encode(self, slot: torch.Tensor) -> torch.Tensor:
         scale = self._positive_parameter(self.input_scale_raw)
@@ -175,6 +323,7 @@ class FeedbackFSONN(nn.Module):
         slot: torch.Tensor,
         feedback: Optional[torch.Tensor] = None,
         feedback_layer_index: Optional[int] = None,
+        feedback_layer_indices: Optional[Sequence[int]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         field = self._encode(slot)
         field = band_limited_angular_spectrum(
@@ -184,35 +333,44 @@ class FeedbackFSONN(nn.Module):
             self.config.wavelength_nm,
             self.config.asm_padding_factor,
         )
-        feedback_phase = None
+        selected_indices = self._resolve_feedback_layer_indices(
+            feedback_layer_indices,
+            feedback_layer_index,
+        )
+        feedback_phases = {}
         if feedback is not None:
             if feedback.shape != slot.shape:
                 raise ValueError("feedback must match the current slot shape")
-            index = (
-                self.config.feedback_layer_index
-                if feedback_layer_index is None
-                else int(feedback_layer_index)
-            )
-            if not 0 <= index < len(self.slm_layers):
-                raise ValueError("feedback_layer_index must identify an existing SLM layer")
-            feedback_phase = self._feedback_to_phase(feedback)
-        else:
-            index = -1
-
+            feedback_phases = self._feedback_to_phases(feedback)
+        feedback_phase = (
+            next(iter(feedback_phases.values()))
+            if len(feedback_phases) == 1
+            else None
+        )
+        phase_abs_max = (
+            torch.stack(
+                [phase.abs().max() for phase in feedback_phases.values()]
+            ).max()
+            if feedback_phases
+            else torch.zeros((), device=slot.device, dtype=slot.dtype)
+        )
         debug = {
-            "feedback_gain": self._positive_parameter(self.feedback_gain_raw),
+            "feedback_gain": self._effective_feedback_gains(),
             "feedback_phase": feedback_phase,
-            "feedback_phase_abs_max": (
-                feedback_phase.abs().max()
-                if feedback_phase is not None
-                else torch.zeros((), device=slot.device, dtype=slot.dtype)
+            "feedback_phases": feedback_phases,
+            "feedback_phase_abs_max": phase_abs_max,
+            "feedback_layer_index": (
+                selected_indices[0]
+                if self.config.feedback_layer_mode == "single"
+                else None
             ),
-            "feedback_layer_index": index,
-            "feedback_used": feedback is not None,
+            "feedback_layer_indices": selected_indices,
+            "feedback_layer_mode": self.config.feedback_layer_mode,
+            "feedback_gain_mode": self.config.feedback_gain_mode,
+            "feedback_used": feedback is not None and bool(feedback_phases),
         }
         for layer_index, slm in enumerate(self.slm_layers):
-            phase_delta = feedback_phase if layer_index == index else None
-            field = slm(field, phase_delta=phase_delta)
+            field = slm(field, phase_delta=feedback_phases.get(layer_index))
             debug[f"slm_{layer_index + 1}_field"] = field
             if layer_index < len(self.slm_layers) - 1:
                 field = band_limited_angular_spectrum(
@@ -244,6 +402,7 @@ class FeedbackFSONN(nn.Module):
         return_debug: bool = False,
         feedback: Optional[torch.Tensor] = None,
         feedback_layer_index: Optional[int] = None,
+        feedback_layer_indices: Optional[Sequence[int]] = None,
     ):
         if x.ndim != 3 or x.shape[-1] != self.config.input_dim:
             raise ValueError(
@@ -257,6 +416,7 @@ class FeedbackFSONN(nn.Module):
                 slot,
                 feedback=feedback,
                 feedback_layer_index=feedback_layer_index,
+                feedback_layer_indices=feedback_layer_indices,
             )
             outputs.append(output)
             debug_slots.append(debug)

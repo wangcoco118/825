@@ -9,15 +9,30 @@ from src.models.predictor import ONNFeedbackPredictor
 
 
 class RecordingONN(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, num_slm_layers=4):
         super().__init__()
         self.projection = nn.Linear(dim, dim)
-        self.slm_layers = nn.ModuleList([nn.Identity() for _ in range(4)])
+        self.slm_layers = nn.ModuleList(
+            [nn.Identity() for _ in range(num_slm_layers)]
+        )
         self.feedback_values = []
+        self.feedback_layer_indices_seen = []
         self.outputs = []
 
-    def forward(self, x, feedback=None, feedback_layer_index=None):
+    def forward(
+        self,
+        x,
+        feedback=None,
+        feedback_layer_index=None,
+        feedback_layer_indices=None,
+    ):
         self.feedback_values.append(feedback)
+        indices = feedback_layer_indices
+        if indices is None and feedback_layer_index is not None:
+            indices = (feedback_layer_index,)
+        self.feedback_layer_indices_seen.append(
+            None if indices is None else tuple(indices)
+        )
         output = self.projection(x)
         self.outputs.append(output)
         return output, output
@@ -29,8 +44,8 @@ def full_masks(batch_size=1):
     return context, target
 
 
-def small_onn_config(**overrides):
-    values = {
+def small_onn_values():
+    return {
         "input_dim": 2,
         "output_dim": 2,
         "num_slm_layers": 4,
@@ -50,7 +65,28 @@ def small_onn_config(**overrides):
         "learnable_intensity_offset": True,
         "use_differential_detector": False,
     }
+
+
+def small_onn_config(**overrides):
+    values = small_onn_values()
     values.update(overrides)
+    return ONNConfig.from_mapping(values)
+
+
+def small_multi_onn_config(gain_mode, gain_init=1.0, layer_indices=(2, 3, 4)):
+    values = small_onn_values()
+    values.update(
+        {
+            "num_slm_layers": 5,
+            "slm_intervals_um": [8.0, 8.0, 8.0, 8.0],
+            "feedback_layer_mode": "multi",
+            "feedback_layer_indices": list(layer_indices),
+            "feedback_gain_mode": gain_mode,
+            "feedback_gain_init": gain_init,
+            "feedback_gain_epsilon": 1.0e-6,
+        }
+    )
+    values.pop("feedback_layer_index")
     return ONNConfig.from_mapping(values)
 
 
@@ -279,6 +315,202 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(ValueError):
                     small_onn_config(**{key: value})
+
+
+
+    def test_predictor_multi_mode_passes_layer_indices_without_changing_chunk_order(self):
+        self.assertIn(
+            "feedback_layer_indices",
+            inspect.signature(ONNFeedbackPredictor.__init__).parameters,
+        )
+        core = RecordingONN(384, num_slm_layers=5)
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mlp_hidden_dim=384,
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2, 3, 4],
+            feedback_gain_mode="shared",
+            onn_core=core,
+        )
+        context = torch.randn(1, 1, 1024)
+        masks_ctxt = torch.tensor([[0]], dtype=torch.long)
+        masks_tgt = torch.tensor([[1567]], dtype=torch.long)
+
+        output = predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertEqual(tuple(output.shape), (1, 1, 1024))
+        self.assertIsNone(core.feedback_values[0])
+        self.assertEqual(
+            [value is not None for value in core.feedback_values],
+            [False, True, True, True, True, True, True, True],
+        )
+        self.assertEqual(
+            core.feedback_layer_indices_seen,
+            [(2, 3, 4)] * 8,
+        )
+        self.assertEqual(predictor.feedback_layer_mode, "multi")
+        self.assertEqual(predictor.feedback_layer_indices, (2, 3, 4))
+        self.assertIsNone(predictor.feedback_layer_index)
+        self.assertEqual(predictor.feedback_gain_mode, "shared")
+        self.assertEqual(predictor.last_trace["feedback_layer_mode"], "multi")
+        self.assertEqual(
+            predictor.last_trace["feedback_layer_indices"],
+            (2, 3, 4),
+        )
+
+
+    def test_legacy_single_config_preserves_scalar_gain_and_formula(self):
+        config = small_onn_config()
+        self.assertTrue(hasattr(config, "feedback_layer_mode"))
+        self.assertEqual(config.feedback_layer_mode, "single")
+        self.assertEqual(config.feedback_layer_index, 2)
+        self.assertIsNone(config.feedback_layer_indices)
+        self.assertIsNone(config.feedback_gain_mode)
+        model = FeedbackFSONN(config)
+        self.assertEqual(tuple(model.feedback_gain_raw.shape), ())
+        feedback = torch.tensor([[[1.0, -1.0], [2.0, -2.0]]])
+        normalized = model.feedback_norm(feedback)
+        gain = model._effective_feedback_gains()
+        expected = config.feedback_phase_max_rad * torch.tanh(gain * normalized)
+        actual = model._feedback_to_phases(feedback)
+        self.assertEqual(tuple(actual), (2,))
+        self.assertTrue(torch.equal(actual[2], expected))
+
+    def test_multi_shared_uses_one_scalar_and_equal_layer_phases(self):
+        config = small_multi_onn_config("shared")
+        self.assertEqual(config.feedback_layer_mode, "multi")
+        self.assertEqual(config.feedback_layer_indices, (2, 3, 4))
+        self.assertEqual(config.feedback_gain_mode, "shared")
+        model = FeedbackFSONN(config)
+        self.assertEqual(tuple(model.feedback_gain_raw.shape), ())
+        feedback = torch.randn(1, 2, 2)
+
+        phases = model._feedback_to_phases(feedback)
+
+        self.assertEqual(tuple(phases), (2, 3, 4))
+        self.assertTrue(torch.equal(phases[2], phases[3]))
+        self.assertTrue(torch.equal(phases[3], phases[4]))
+        self.assertLessEqual(
+            max(value.abs().max().item() for value in phases.values()),
+            config.feedback_phase_max_rad + 1e-6,
+        )
+
+    def test_multi_independent_gains_are_not_normalized_and_are_layer_local(self):
+        config = small_multi_onn_config(
+            "independent",
+            gain_init=[0.5, 1.5, 3.0],
+        )
+        model = FeedbackFSONN(config)
+        self.assertEqual(tuple(model.feedback_gain_raw.shape), (3,))
+        gains = model._effective_feedback_gains()
+        self.assertTrue(
+            torch.allclose(gains, torch.tensor([0.5, 1.5, 3.0]), atol=1e-6)
+        )
+        self.assertAlmostEqual(gains.sum().item(), 5.0, places=6)
+        feedback = torch.randn(1, 2, 2)
+        before = model._feedback_to_phases(feedback)
+
+        with torch.no_grad():
+            model.feedback_gain_raw[1].add_(0.75)
+        after = model._feedback_to_phases(feedback)
+
+        self.assertTrue(torch.equal(before[2], after[2]))
+        self.assertFalse(torch.equal(before[3], after[3]))
+        self.assertTrue(torch.equal(before[4], after[4]))
+        self.assertTrue(
+            all(
+                phase.abs().max() <= config.feedback_phase_max_rad + 1e-6
+                for phase in after.values()
+            )
+        )
+
+    def test_layer_mode_configuration_is_strictly_mutually_exclusive(self):
+        invalid = []
+        values = small_onn_values()
+        values.update(
+            feedback_layer_mode="single",
+            feedback_layer_indices=[2, 3],
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.update(
+            feedback_layer_mode="single",
+            feedback_gain_mode="shared",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2],
+            feedback_gain_mode="shared",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2, 2],
+            feedback_gain_mode="shared",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[3, 2],
+            feedback_gain_mode="shared",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2, 4],
+            feedback_gain_mode="shared",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2, 3],
+            feedback_gain_mode="invalid",
+        )
+        invalid.append(values)
+        values = small_onn_values()
+        values.pop("feedback_layer_index")
+        values.update(
+            feedback_layer_mode="multi",
+            feedback_layer_indices=[2, 3],
+            feedback_gain_mode="independent",
+            feedback_gain_init=[1.0],
+        )
+        invalid.append(values)
+
+        for config_values in invalid:
+            with self.subTest(config_values=config_values):
+                with self.assertRaises(ValueError):
+                    ONNConfig.from_mapping(config_values)
+
+    def test_multilayer_injection_selects_only_configured_layers_and_preserves_base_parameters(self):
+        model = FeedbackFSONN(small_multi_onn_config("shared"))
+        slot = torch.tensor([[[0.2, -0.3], [0.4, -0.1]]])
+        feedback = torch.tensor([[[0.1, -0.2], [0.3, -0.4]]])
+        before = [layer.phase_logits.detach().clone() for layer in model.slm_layers]
+
+        _, debug = model._propagate_slot(slot, feedback=feedback)
+
+        self.assertEqual(tuple(debug["feedback_phases"]), (2, 3, 4))
+        self.assertEqual(debug["feedback_layer_indices"], (2, 3, 4))
+        for layer_index in (2, 3, 4):
+            self.assertIsNotNone(debug["feedback_phases"][layer_index])
+        for old, layer in zip(before, model.slm_layers):
+            self.assertTrue(torch.equal(old, layer.phase_logits))
 
 
 
